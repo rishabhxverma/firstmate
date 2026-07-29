@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, NUDGE_SECONDMATES, FMX, or PROJECT_ENV - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -50,3 +50,7 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `PROJECT_ENV: project <name>: pool worktrees carry local .env content but no declared source at config/project-env/<name>.env - ...` - some existing pool worktree already has local secrets, but nothing declares them as the project's canonical local environment, so future pool slots will keep drifting apart the same way an undeclared credential drifts today.
+  Ask the captain (or infer from the existing worktree content, without ever relaying its values) what the project's declared local environment should contain, then have a crewmate or firstmate itself write `config/project-env/<name>.env` from that answer; never inline or echo the source worktree's actual secret values while doing this.
+- `PROJECT_ENV: project <name>: N of M pool worktree(s) are missing keys the declared source has - run bin/fm-project-env-sync.sh <name> to converge` - the pool has drifted the exact way a spawn into the wrong slot would surface as a stalled task blocked on a missing credential.
+  Run `bin/fm-project-env-sync.sh <name>` to converge every existing slot; it only adds keys a worktree is missing and never touches or overwrites a key already present, so it is safe to run any time.

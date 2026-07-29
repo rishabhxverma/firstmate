@@ -16,7 +16,8 @@
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "PROJECT_ENV: project <name>: <detail>".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
 #          an origin fetch) AND its loaded instruction surface (AGENTS.md, bin/,
@@ -58,6 +59,14 @@
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
+#          PROJECT_ENV is a read-only scan (bin/fm-project-env-lib.sh) of every
+#          registered project's treehouse pool: it reports when pool worktrees
+#          already carry local .env content but the project has no declared
+#          source at config/project-env/<name>.env, and when some pool worktree
+#          is missing a key the declared source has - drift that
+#          bin/fm-project-env-sync.sh <name> converges. Silent when a project
+#          has no pool yet, or its pool is already converged. Never prints a
+#          key name or value.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT when it is a non-empty
@@ -97,6 +106,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-project-env-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-project-env-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
@@ -701,6 +712,51 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+# project_env_status_check: read-only scan of every registered project's
+# treehouse pool (bin/fm-project-env-lib.sh). Reports actionable drift only;
+# never prints a key name or value, and never writes anything itself (repair
+# is bin/fm-project-env-sync.sh, run on captain/firstmate decision).
+project_env_status_check() {
+  command -v treehouse >/dev/null 2>&1 || return 0
+  [ -d "$PROJECTS" ] || return 0
+  local proj_dir name src pool total missing slot has_content
+  for proj_dir in "$PROJECTS"/*/; do
+    [ -d "$proj_dir" ] || continue
+    git -C "$proj_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    name=$(basename "$proj_dir")
+    src=$(fm_project_env_source_path "$CONFIG" "$name") || continue
+    pool=$(fm_project_env_pool_worktrees "$proj_dir") || continue
+    [ -n "$pool" ] || continue
+    if [ ! -f "$src" ]; then
+      has_content=0
+      while IFS= read -r slot; do
+        [ -n "$slot" ] || continue
+        [ -s "$slot/.env" ] && has_content=1 && break
+      done <<EOF
+$pool
+EOF
+      if [ "$has_content" -eq 1 ]; then
+        echo "PROJECT_ENV: project $name: pool worktrees carry local .env content but no declared source at config/project-env/$name.env - declare one so it converges deterministically instead of drifting between slots"
+      fi
+      continue
+    fi
+    total=0
+    missing=0
+    while IFS= read -r slot; do
+      [ -n "$slot" ] || continue
+      total=$((total + 1))
+      if [ -n "$(fm_project_env_missing_lines "$src" "$slot/.env" 2>/dev/null)" ]; then
+        missing=$((missing + 1))
+      fi
+    done <<EOF
+$pool
+EOF
+    if [ "$missing" -gt 0 ]; then
+      echo "PROJECT_ENV: project $name: $missing of $total pool worktree(s) are missing keys the declared source has - run bin/fm-project-env-sync.sh $name to converge"
+    fi
+  done
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
@@ -864,6 +920,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != 
   echo "BOOTSTRAP_INFO: crew harness override active: $crew"
 fi
 crew_dispatch_validate
+project_env_status_check
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "BOOTSTRAP_INFO: tasks-axi available"
