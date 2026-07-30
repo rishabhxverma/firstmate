@@ -16,7 +16,8 @@
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "PROJECT_ENV: project <name>: <detail>".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
 #          an origin fetch) AND its loaded instruction surface (AGENTS.md, bin/,
@@ -58,6 +59,19 @@
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
+#          PROJECT_ENV is a read-only scan (bin/fm-project-env-lib.sh) of every
+#          registered project's treehouse pool: it reports when pool worktrees
+#          already carry local .env content but the project has no declared
+#          source at config/project-env/<name>.env, and when some pool worktree
+#          is missing a key the declared source has - drift that
+#          bin/fm-project-env-sync.sh <name> converges. Silent when a project
+#          has no pool yet, or its pool is already converged. Never prints a
+#          key name or value. Each project's pool lookup is bounded by
+#          FM_PROJECT_ENV_SCAN_TIMEOUT seconds (default 10; a non-numeric or
+#          zero value falls back to 10); a project whose lookup times out is
+#          skipped silently and never stalls or fails session start. The scan
+#          itself has no opt-out: silent drift is the failure mode it exists to
+#          prevent.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT when it is a non-empty
@@ -97,6 +111,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-project-env-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-project-env-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
@@ -701,6 +717,100 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+# project_env_status_check: read-only scan of every registered project's
+# treehouse pool (bin/fm-project-env-lib.sh). Reports actionable drift only;
+# never prints a key name or value, and never writes anything itself (repair
+# is bin/fm-project-env-sync.sh, run on captain/firstmate decision).
+project_env_scan_timeout() {
+  if [ -n "${FM_PROJECT_ENV_SCAN_TIMEOUT:-}" ]; then
+    case "$FM_PROJECT_ENV_SCAN_TIMEOUT" in
+      *[!0-9]*|'') echo 10 ;;
+      0) echo 10 ;;
+      *) echo "$FM_PROJECT_ENV_SCAN_TIMEOUT" ;;
+    esac
+    return 0
+  fi
+  echo 10
+}
+
+# project_env_pool_worktrees_bounded <project-dir> <timeout>
+# Same output as fm_project_env_pool_worktrees, but abandons a slow or hanging
+# treehouse invocation after <timeout> seconds so one unresponsive project can
+# never stall session start. Returns non-zero on timeout, which the caller
+# treats as "skip this project" - never as a failure.
+project_env_pool_worktrees_bounded() {
+  local project_dir=$1 timeout=$2 tmp pid start elapsed monitor_was_on=0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-project-env-pool.XXXXXX" 2>/dev/null) || return 1
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null || true
+  fm_project_env_pool_worktrees "$project_dir" >"$tmp" 2>/dev/null &
+  pid=$!
+  start=$SECONDS
+  while jobs -r -p | grep -qx "$pid"; do
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+      rm -f "$tmp"
+      return 1
+    fi
+    sleep 1
+  done
+  wait "$pid" 2>/dev/null || true
+  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+project_env_status_check() {
+  command -v treehouse >/dev/null 2>&1 || return 0
+  [ -d "$PROJECTS" ] || return 0
+  local proj_dir name src pool total missing slot has_content timeout missing_rc
+  timeout=$(project_env_scan_timeout)
+  for proj_dir in "$PROJECTS"/*/; do
+    [ -d "$proj_dir" ] || continue
+    git -C "$proj_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    name=$(basename "$proj_dir")
+    src=$(fm_project_env_source_path "$CONFIG" "$name") || continue
+    pool=$(project_env_pool_worktrees_bounded "$proj_dir" "$timeout") || continue
+    [ -n "$pool" ] || continue
+    if [ ! -f "$src" ] || [ -L "$src" ]; then
+      has_content=0
+      while IFS= read -r slot; do
+        [ -n "$slot" ] || continue
+        [ -s "$slot/.env" ] && has_content=1 && break
+      done <<EOF
+$pool
+EOF
+      if [ "$has_content" -eq 1 ]; then
+        echo "PROJECT_ENV: project $name: pool worktrees carry local .env content but no usable declared source at config/project-env/$name.env (it must be a plain file; a symlink is refused) - declare one so it converges deterministically instead of drifting between slots"
+      fi
+      continue
+    fi
+    missing_rc=0
+    fm_project_env_missing_lines "$src" /dev/null >/dev/null 2>&1 || missing_rc=$?
+    if [ "$missing_rc" -eq 2 ]; then
+      echo "PROJECT_ENV: project $name: declared source config/project-env/$name.env ends with an unterminated quoted value - it cannot be merged into a worktree until that is fixed"
+      continue
+    fi
+    total=0
+    missing=0
+    while IFS= read -r slot; do
+      [ -n "$slot" ] || continue
+      total=$((total + 1))
+      if [ -n "$(fm_project_env_missing_lines "$src" "$slot/.env" 2>/dev/null)" ]; then
+        missing=$((missing + 1))
+      fi
+    done <<EOF
+$pool
+EOF
+    if [ "$missing" -gt 0 ]; then
+      echo "PROJECT_ENV: project $name: $missing of $total pool worktree(s) are missing keys the declared source has - run bin/fm-project-env-sync.sh $name to converge"
+    fi
+  done
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
@@ -864,6 +974,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != 
   echo "BOOTSTRAP_INFO: crew harness override active: $crew"
 fi
 crew_dispatch_validate
+project_env_status_check
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "BOOTSTRAP_INFO: tasks-axi available"
