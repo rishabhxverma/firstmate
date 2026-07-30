@@ -109,6 +109,11 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
+#   A ship/scout spawn also converges the worktree's .env from the declared
+#   per-project source at config/project-env/<project>.env, merging in any key
+#   the worktree is missing without ever touching a key it already has
+#   (fm-project-env-lib.sh; bin/fm-project-env-sync.sh repairs an existing
+#   pool's drift on demand).
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -192,6 +197,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-secondmate-nudge-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-project-env-lib.sh
+. "$SCRIPT_DIR/fm-project-env-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -1640,6 +1647,31 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
+fi
+
+# Declared per-project local-environment propagation (bin/fm-project-env-lib.sh;
+# PRIME-DIRECTIVE-1 exception documented there and in AGENTS.md section 1). Ship
+# and scout worktrees only - a --secondmate spawn has its own inheritance surface
+# (propagate_secondmate_inheritance above) and never a project worktree here.
+# Never logs a key name or value; only a status word and a key count. Skipped
+# entirely when the project does not gitignore .env, which is the precondition
+# the exception rests on.
+if [ "$KIND" != secondmate ]; then
+  PROJECT_ENV_SRC=$(fm_project_env_source_path "$CONFIG" "$(basename "$PROJ_ABS")") || PROJECT_ENV_SRC=
+  if [ -n "$PROJECT_ENV_SRC" ] && [ -f "$PROJECT_ENV_SRC" ] && ! fm_project_env_dest_gitignored "$WT/.env"; then
+    echo "warning: project-env skipped for $WT/.env: this project does not gitignore .env, so propagating it could let a crewmate commit credentials" >&2
+    PROJECT_ENV_SRC=
+  fi
+  if [ -n "$PROJECT_ENV_SRC" ]; then
+    if fm_project_env_sync_file "$PROJECT_ENV_SRC" "$WT/.env"; then
+      case "$FM_PROJECT_ENV_STATUS" in
+        seeded) echo "project-env: seeded $WT/.env from declared source" ;;
+        merged) echo "project-env: merged $FM_PROJECT_ENV_DETAIL missing key(s) into $WT/.env" ;;
+      esac
+    else
+      echo "warning: project-env sync failed for $WT/.env: ${FM_PROJECT_ENV_DETAIL:-unknown error}" >&2
+    fi
+  fi
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't

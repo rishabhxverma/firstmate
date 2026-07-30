@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, SECONDMATE_HANDOFF, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, SECONDMATE_HANDOFF, NUDGE_SECONDMATES, FMX, or PROJECT_ENV - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -55,3 +55,12 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send on the same local or remote route.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `PROJECT_ENV: project <name>: pool worktrees carry local .env content but no usable declared source at config/project-env/<name>.env (it must be a plain file; a symlink is refused) - ...` - some existing pool worktree already has local secrets, but nothing declares them as the project's canonical local environment, so future pool slots will keep drifting apart the same way an undeclared credential drifts today.
+  Ask the captain (or infer from the existing worktree content, without ever relaying its values) what the project's declared local environment should contain, then have a crewmate or firstmate itself write `config/project-env/<name>.env` from that answer; never inline or echo the source worktree's actual secret values while doing this.
+  This same line appears when that path exists but is a symlink, because the propagation deliberately refuses a symlinked source; replace it with a plain file so the suggested repair can actually converge.
+- `PROJECT_ENV: project <name>: declared source config/project-env/<name>.env ends with an unterminated quoted value - ...` - a multi-line value in the declared source never closes its quote, so merging it into a worktree would leave that worktree's whole `.env` unloadable.
+  Close the quote in `config/project-env/<name>.env` (without echoing any value), then rerun `bin/fm-project-env-sync.sh <name>`.
+- `PROJECT_ENV: project <name>: N of M pool worktree(s) are missing keys the declared source has - run bin/fm-project-env-sync.sh <name> to converge` - the pool has drifted the exact way a spawn into the wrong slot would surface as a stalled task blocked on a missing credential.
+  Run `bin/fm-project-env-sync.sh <name>` to converge every existing slot; it only adds keys a worktree is missing and never touches or overwrites a key already present, so it is safe to run any time.
+  A slot it reports as `skipped (.env is not gitignored by this project)` needs `.env` added to that project's `.gitignore` first; the propagation refuses to write a credential a crewmate's `git add -A` could commit.
+  The scan that produces these lines is bounded per project by `FM_PROJECT_ENV_SCAN_TIMEOUT` (default 10 seconds); a project whose treehouse pool lookup times out is skipped silently that session, so absence of a PROJECT_ENV line is not proof of convergence when treehouse is slow.
