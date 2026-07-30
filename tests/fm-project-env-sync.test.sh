@@ -34,6 +34,17 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# make_slot <dir> [no-ignore]: a pool slot that gitignores .env the way a real
+# project does, so the propagation's gitignore precondition holds. Pass
+# "no-ignore" for a slot whose repo does NOT ignore .env.
+make_slot() {
+  local dir=$1 mode=${2:-ignore}
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  [ "$mode" = ignore ] && printf '.env\n' > "$dir/.gitignore"
+  printf '%s\n' "$dir"
+}
+
 new_world() {
   local name=$1 home
   home="$TMP_ROOT/$name/home"
@@ -67,7 +78,9 @@ test_converges_seeded_and_merged_slots_without_clobbering_extra_content() {
   slot_fresh="$TMP_ROOT/converge/slot-fresh"
   slot_partial="$TMP_ROOT/converge/slot-partial"
   slot_extra="$TMP_ROOT/converge/slot-extra"
-  mkdir -p "$slot_fresh" "$slot_partial" "$slot_extra"
+  make_slot "$slot_fresh" >/dev/null
+  make_slot "$slot_partial" >/dev/null
+  make_slot "$slot_extra" >/dev/null
   printf 'CURSEFORGE_API_KEY=cf-local-override\n' > "$slot_partial/.env"
   printf 'ANTHROPIC_API_KEY=%s\nCURSEFORGE_API_KEY=cf-declared\nEXTRA_LOCAL_TOOL_TOKEN=keep-me\n' "$SECRET_VALUE" \
     > "$slot_extra/.env"
@@ -112,7 +125,33 @@ test_converges_seeded_and_merged_slots_without_clobbering_extra_content() {
   pass "convergence seeds bare slots, merges missing keys into partial slots, and never clobbers slot-local content; idempotent on re-run"
 }
 
+test_slot_that_does_not_gitignore_env_is_skipped_not_written() {
+  local home fakebin slot status_file out rc
+  home=$(new_world unignored)
+  mkdir -p "$home/config/project-env"
+  printf 'ANTHROPIC_API_KEY=%s\n' "$SECRET_VALUE" > "$home/config/project-env/proj.env"
+
+  slot="$TMP_ROOT/unignored/slot-tracked"
+  make_slot "$slot" no-ignore >/dev/null
+  status_file="$TMP_ROOT/unignored/status.txt"
+  printf '1     in-use       %s\n' "$slot" > "$status_file"
+
+  fakebin=$(make_fake_treehouse "$TMP_ROOT/unignored")
+  out=$(PATH="$fakebin:$BASE_PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_FAKE_TREEHOUSE_STATUS="$status_file" \
+    "$SYNC" proj 2>&1)
+  rc=$?
+
+  [ "$rc" -eq 0 ] || fail "skipping a non-ignoring slot is not an error, got $rc: $out"
+  assert_contains "$out" "not gitignored" "the skip must say why, without naming a key"
+  assert_not_contains "$out" "$SECRET_VALUE" "the skip notice must never contain a secret value"
+  assert_absent "$slot/.env" "a slot whose repo does not ignore .env must never be written"
+  pass "a pool slot that does not gitignore .env is skipped rather than seeded with a committable credential"
+}
+
 test_no_declared_source_is_a_clean_noop
 test_converges_seeded_and_merged_slots_without_clobbering_extra_content
+test_slot_that_does_not_gitignore_env_is_skipped_not_written
 
 echo "# all fm-project-env-sync tests passed"

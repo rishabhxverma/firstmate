@@ -135,8 +135,87 @@ test_fm_project_env_source_path_rejects_unsafe_names() {
   pass "fm_project_env_source_path resolves plain names and rejects unsafe ones"
 }
 
+test_export_prefixed_destination_key_counts_as_present() {
+  local dir src dest before after
+  dir="$TMP_ROOT/export-prefix"
+  mkdir -p "$dir/worktree"
+  src="$dir/source.env"
+  dest="$dir/worktree/.env"
+  printf 'ANTHROPIC_API_KEY=%s\n' "$SECRET_VALUE" > "$src"
+  printf 'export ANTHROPIC_API_KEY=rotated-in-this-worktree\n' > "$dest"
+  before=$(cat "$dest")
+
+  fm_project_env_sync_file "$src" "$dest" >/dev/null 2>&1
+  [ "$FM_PROJECT_ENV_STATUS" = unchanged ] \
+    || fail "an 'export KEY=' destination line should count as that key being present, got '$FM_PROJECT_ENV_STATUS'"
+  after=$(cat "$dest")
+  [ "$before" = "$after" ] || fail "a rotated 'export KEY=' value must not be shadowed by an appended source line"
+  assert_no_grep "$SECRET_VALUE" "$dest" "the source value must never be appended behind an export-prefixed key"
+
+  fm_project_env_sync_file "$src" "$dest" >/dev/null 2>&1
+  [ "$(cat "$dest")" = "$before" ] || fail "re-running must not duplicate the export-prefixed key"
+  pass "an 'export KEY=' (or indented) destination key is recognized as present, so it is never shadowed or duplicated"
+}
+
+test_multiline_source_value_is_appended_whole() {
+  local dir src dest
+  dir="$TMP_ROOT/multiline"
+  mkdir -p "$dir/worktree"
+  src="$dir/source.env"
+  dest="$dir/worktree/.env"
+  printf 'SERVICE_KEY="line-one\nline-two"\nPLAIN_KEY=plain\n' > "$src"
+  printf 'PLAIN_KEY=already-here\n' > "$dest"
+
+  fm_project_env_sync_file "$src" "$dest" >/dev/null 2>&1
+  [ "$FM_PROJECT_ENV_STATUS" = merged ] || fail "a missing multiline key should merge, got '$FM_PROJECT_ENV_STATUS'"
+  [ "$FM_PROJECT_ENV_DETAIL" = 1 ] || fail "a multiline value counts as one key, detail was '$FM_PROJECT_ENV_DETAIL'"
+  assert_grep 'line-two"' "$dest" "the continuation line of a multiline value must be carried with its key"
+  # shellcheck source=/dev/null
+  ( set -a; . "$dest" ) >/dev/null 2>&1 \
+    || fail "the merged destination must still be loadable, i.e. no unterminated quote was written"
+  pass "a multiline declared value is appended with every continuation line, so the destination stays loadable"
+}
+
+test_unterminated_source_quote_is_refused_not_half_written() {
+  local dir src dest before
+  dir="$TMP_ROOT/unterminated"
+  mkdir -p "$dir/worktree"
+  src="$dir/source.env"
+  dest="$dir/worktree/.env"
+  printf 'GOOD_KEY=fine\nBROKEN_KEY="never-closed\n' > "$src"
+  printf 'LOCAL_ONLY=keep-me\n' > "$dest"
+  before=$(cat "$dest")
+
+  fm_project_env_sync_file "$src" "$dest" >/dev/null 2>&1 \
+    && fail "a source ending with an unterminated quote should be an error, not a partial merge"
+  [ "$FM_PROJECT_ENV_STATUS" = error ] || fail "expected error status, got '$FM_PROJECT_ENV_STATUS'"
+  [ "$(cat "$dest")" = "$before" ] || fail "a refused merge must leave the destination byte-for-byte unchanged"
+  pass "a declared source with an unterminated quoted value is refused outright rather than half-written"
+}
+
+test_gitignored_destination_precondition() {
+  local dir
+  dir="$TMP_ROOT/gitignore"
+  mkdir -p "$dir/ignoring" "$dir/tracking" "$dir/plain"
+  git -C "$dir/ignoring" init -q
+  printf '.env\n' > "$dir/ignoring/.gitignore"
+  git -C "$dir/tracking" init -q
+
+  fm_project_env_dest_gitignored "$dir/ignoring/.env" \
+    || fail "a repo whose .gitignore lists .env should satisfy the precondition"
+  fm_project_env_dest_gitignored "$dir/tracking/.env" \
+    && fail "a repo that does not ignore .env must fail the precondition"
+  fm_project_env_dest_gitignored "$dir/plain/.env" \
+    && fail "a directory that is not a git working tree must fail the precondition"
+  pass "fm_project_env_dest_gitignored succeeds only where the owning repo actually ignores the destination"
+}
+
 test_fresh_worktree_is_seeded_with_full_source
 test_existing_worktree_gains_missing_key_without_losing_its_own
+test_export_prefixed_destination_key_counts_as_present
+test_multiline_source_value_is_appended_whole
+test_unterminated_source_quote_is_refused_not_half_written
+test_gitignored_destination_precondition
 test_fully_converged_worktree_is_unchanged_and_idempotent
 test_missing_declared_source_is_a_silent_noop
 test_symlink_destination_is_skipped_not_followed

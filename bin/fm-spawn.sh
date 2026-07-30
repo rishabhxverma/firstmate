@@ -1299,9 +1299,15 @@ fi
 # PRIME-DIRECTIVE-1 exception documented there and in AGENTS.md section 1). Ship
 # and scout worktrees only - a --secondmate spawn has its own inheritance surface
 # (propagate_secondmate_inheritance above) and never a project worktree here.
-# Never logs a key name or value; only a status word and a key count.
+# Never logs a key name or value; only a status word and a key count. Skipped
+# entirely when the project does not gitignore .env, which is the precondition
+# the exception rests on.
 if [ "$KIND" != secondmate ]; then
   PROJECT_ENV_SRC=$(fm_project_env_source_path "$CONFIG" "$(basename "$PROJ_ABS")") || PROJECT_ENV_SRC=
+  if [ -n "$PROJECT_ENV_SRC" ] && [ -f "$PROJECT_ENV_SRC" ] && ! fm_project_env_dest_gitignored "$WT/.env"; then
+    echo "warning: project-env skipped for $WT/.env: this project does not gitignore .env, so propagating it could let a crewmate commit credentials" >&2
+    PROJECT_ENV_SRC=
+  fi
   if [ -n "$PROJECT_ENV_SRC" ]; then
     if fm_project_env_sync_file "$PROJECT_ENV_SRC" "$WT/.env"; then
       case "$FM_PROJECT_ENV_STATUS" in

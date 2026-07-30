@@ -47,11 +47,13 @@ SH
   printf '%s\n' "$fakebin"
 }
 
-# make_case <name> <id>: a home with a declared project-env source for
-# "demoproj", a real primary checkout, and a real git worktree standing in
-# for a treehouse pool slot that has already settled at spawn time.
+# make_case <name> <id> [no-ignore]: a home with a declared project-env source
+# for "demoproj", a real primary checkout, and a real git worktree standing in
+# for a treehouse pool slot that has already settled at spawn time. The
+# worktree gitignores .env the way a real project does, which is the
+# precondition the propagation requires; pass "no-ignore" to omit it.
 make_case() {
-  local name=$1 id=$2 case_dir home proj wt fakebin
+  local name=$1 id=$2 ignore=${3:-ignore} case_dir home proj wt fakebin
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/demoproj"
@@ -62,6 +64,7 @@ make_case() {
   printf 'ANTHROPIC_API_KEY=%s\nCURSEFORGE_API_KEY=cf-declared\n' "$SECRET_VALUE" \
     > "$home/config/project-env/demoproj.env"
   fm_git_worktree "$proj" "$wt" "wt-$name"
+  [ "$ignore" = ignore ] && printf '.env\n' > "$wt/.gitignore"
   mkdir -p "$home/data/$id"
   printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
   touch "$home/state/.last-watcher-beat"
@@ -133,7 +136,25 @@ EOF
   pass "a reused worktree's local content is merged with, never clobbered by, the declared per-project env"
 }
 
+test_worktree_that_does_not_gitignore_env_is_skipped() {
+  local rec case_dir home proj wt fakebin id out
+  id=penv-unignored-z3
+  rec=$(make_case unignored "$id" no-ignore)
+  IFS='|' read -r case_dir home proj wt fakebin <<EOF
+$rec
+EOF
+
+  out=$(run_spawn "$id" "$home" "$proj" "$wt" "$fakebin")
+  expect_code 0 "$?" "spawn should still succeed when the env propagation is skipped"
+  assert_contains "$out" "does not gitignore .env" "spawn should say why the propagation was skipped"
+  assert_not_contains "$out" "project-env: seeded" "a non-ignoring worktree must not be seeded"
+  assert_not_contains "$out" "$SECRET_VALUE" "the skip warning must never contain a secret value"
+  assert_absent "$wt/.env" "a credential must never be written where git would let a crewmate commit it"
+  pass "a worktree whose project does not gitignore .env is skipped, and the spawn itself still succeeds"
+}
+
 test_fresh_worktree_gets_the_declared_env_at_spawn_time
 test_reused_worktree_with_local_content_is_merged_not_clobbered
+test_worktree_that_does_not_gitignore_env_is_skipped
 
 echo "# all fm-spawn-project-env tests passed"

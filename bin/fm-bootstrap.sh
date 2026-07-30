@@ -66,7 +66,12 @@
 #          is missing a key the declared source has - drift that
 #          bin/fm-project-env-sync.sh <name> converges. Silent when a project
 #          has no pool yet, or its pool is already converged. Never prints a
-#          key name or value.
+#          key name or value. Each project's pool lookup is bounded by
+#          FM_PROJECT_ENV_SCAN_TIMEOUT seconds (default 10; a non-numeric or
+#          zero value falls back to 10); a project whose lookup times out is
+#          skipped silently and never stalls or fails session start. The scan
+#          itself has no opt-out: silent drift is the failure mode it exists to
+#          prevent.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT when it is a non-empty
@@ -716,18 +721,61 @@ EOF
 # treehouse pool (bin/fm-project-env-lib.sh). Reports actionable drift only;
 # never prints a key name or value, and never writes anything itself (repair
 # is bin/fm-project-env-sync.sh, run on captain/firstmate decision).
+project_env_scan_timeout() {
+  if [ -n "${FM_PROJECT_ENV_SCAN_TIMEOUT:-}" ]; then
+    case "$FM_PROJECT_ENV_SCAN_TIMEOUT" in
+      *[!0-9]*|'') echo 10 ;;
+      0) echo 10 ;;
+      *) echo "$FM_PROJECT_ENV_SCAN_TIMEOUT" ;;
+    esac
+    return 0
+  fi
+  echo 10
+}
+
+# project_env_pool_worktrees_bounded <project-dir> <timeout>
+# Same output as fm_project_env_pool_worktrees, but abandons a slow or hanging
+# treehouse invocation after <timeout> seconds so one unresponsive project can
+# never stall session start. Returns non-zero on timeout, which the caller
+# treats as "skip this project" - never as a failure.
+project_env_pool_worktrees_bounded() {
+  local project_dir=$1 timeout=$2 tmp pid start elapsed monitor_was_on=0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-project-env-pool.XXXXXX" 2>/dev/null) || return 1
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null || true
+  fm_project_env_pool_worktrees "$project_dir" >"$tmp" 2>/dev/null &
+  pid=$!
+  start=$SECONDS
+  while jobs -r -p | grep -qx "$pid"; do
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+      rm -f "$tmp"
+      return 1
+    fi
+    sleep 1
+  done
+  wait "$pid" 2>/dev/null || true
+  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
 project_env_status_check() {
   command -v treehouse >/dev/null 2>&1 || return 0
   [ -d "$PROJECTS" ] || return 0
-  local proj_dir name src pool total missing slot has_content
+  local proj_dir name src pool total missing slot has_content timeout missing_rc
+  timeout=$(project_env_scan_timeout)
   for proj_dir in "$PROJECTS"/*/; do
     [ -d "$proj_dir" ] || continue
     git -C "$proj_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
     name=$(basename "$proj_dir")
     src=$(fm_project_env_source_path "$CONFIG" "$name") || continue
-    pool=$(fm_project_env_pool_worktrees "$proj_dir") || continue
+    pool=$(project_env_pool_worktrees_bounded "$proj_dir" "$timeout") || continue
     [ -n "$pool" ] || continue
-    if [ ! -f "$src" ]; then
+    if [ ! -f "$src" ] || [ -L "$src" ]; then
       has_content=0
       while IFS= read -r slot; do
         [ -n "$slot" ] || continue
@@ -736,8 +784,14 @@ project_env_status_check() {
 $pool
 EOF
       if [ "$has_content" -eq 1 ]; then
-        echo "PROJECT_ENV: project $name: pool worktrees carry local .env content but no declared source at config/project-env/$name.env - declare one so it converges deterministically instead of drifting between slots"
+        echo "PROJECT_ENV: project $name: pool worktrees carry local .env content but no usable declared source at config/project-env/$name.env (it must be a plain file; a symlink is refused) - declare one so it converges deterministically instead of drifting between slots"
       fi
+      continue
+    fi
+    missing_rc=0
+    fm_project_env_missing_lines "$src" /dev/null >/dev/null 2>&1 || missing_rc=$?
+    if [ "$missing_rc" -eq 2 ]; then
+      echo "PROJECT_ENV: project $name: declared source config/project-env/$name.env ends with an unterminated quoted value - it cannot be merged into a worktree until that is fixed"
       continue
     fi
     total=0

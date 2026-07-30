@@ -11,6 +11,8 @@
 # merges any keys a worktree is missing into that worktree's .env, one line
 # per pool slot: "slot <path>: <status>[ (<detail>)]". Never prints a key name
 # or value - only status words and bare counts.
+# A slot whose repository does not gitignore .env is skipped, never written:
+# that is the precondition the PRIME-DIRECTIVE-1 exception rests on.
 # No declared source is not an error: prints one line and exits 0, so a
 # project that genuinely needs no shared local environment stays quiet.
 # Exits non-zero only when a real propagation error occurred for some slot.
@@ -19,7 +21,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -64,6 +66,10 @@ echo "project-env-sync: $NAME: converging from $SRC"
 errors=0
 while IFS= read -r slot; do
   [ -n "$slot" ] || continue
+  if ! fm_project_env_dest_gitignored "$slot/.env"; then
+    printf '  slot %s: skipped (.env is not gitignored by this project)\n' "$slot"
+    continue
+  fi
   if fm_project_env_sync_file "$SRC" "$slot/.env"; then
     case "$FM_PROJECT_ENV_STATUS" in
       merged) printf '  slot %s: merged (%s key(s) added)\n' "$slot" "$FM_PROJECT_ENV_DETAIL" ;;
