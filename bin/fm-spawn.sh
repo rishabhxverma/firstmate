@@ -1952,6 +1952,12 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+# Metadata publication is the point where the task becomes recoverable, so a
+# failed write must abort the spawn and let the EXIT trap release the backend's
+# resources. The `|| exit` is explicit rather than left to `set -e`: stock macOS
+# Bash 3.2 does not treat a redirection failure on a COMPOUND command as an
+# errexit trigger, so relying on it would let a spawn report success while its
+# metadata was never written.
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
@@ -1993,7 +1999,7 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-} > "$STATE/$ID.meta"
+} > "$STATE/$ID.meta" || { echo "error: cannot publish task metadata at $STATE/$ID.meta; aborting the spawn" >&2; exit 1; }
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")

@@ -12,6 +12,10 @@ set -u
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-project-env)
 SECRET_VALUE="sk-super-secret-do-not-print-1122334455"
+# A ship spawn carries an explicit delivery contract (bin/fm-spawn.sh's --mode /
+# --yolo); the env propagation under test is independent of which contract it is,
+# so these cases use the standing default and record the same mode in the brief.
+SPAWN_MODE=no-mistakes
 
 file_mode() {
   if [ "$(uname)" = Darwin ]; then
@@ -66,7 +70,8 @@ make_case() {
   fm_git_worktree "$proj" "$wt" "wt-$name"
   [ "$ignore" = ignore ] && printf '.env\n' > "$wt/.gitignore"
   mkdir -p "$home/data/$id"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  printf 'brief for %s\n\n# Definition of done\nDelivery contract: mode=%s\n' \
+    "$id" "$SPAWN_MODE" > "$home/data/$id/brief.md"
   touch "$home/state/.last-watcher-beat"
   printf '%s|%s|%s|%s|%s\n' "$case_dir" "$home" "$proj" "$wt" "$fakebin"
 }
@@ -79,7 +84,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$wt" \
     PATH="$fakebin:$PATH" \
-    "$SPAWN" "$id" "$proj" 2>&1
+    "$SPAWN" "$id" "$proj" --mode "$SPAWN_MODE" --yolo off 2>&1
 }
 
 test_fresh_worktree_gets_the_declared_env_at_spawn_time() {
