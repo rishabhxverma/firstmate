@@ -2,15 +2,26 @@
 # Register and provision a whole secondmate home on an SSH-reachable host.
 #
 # Usage:
-#   fm-remote-home-seed.sh <id> <ssh-alias> <remote-root> <remote-home> {<project>...|--no-projects}
+#   fm-remote-home-seed.sh <id> <ssh-alias> <remote-root> <remote-home> {<project>[=<origin-url>]...|--no-projects}
 #
 # The SSH alias must already reach a host whose non-interactive PATH exposes the
 # fixed fm-remote-entrypoint.sh from <remote-root>. The command records the
-# remote host dimension in data/secondmates.md, sends a bounded provisioning
+# remote host dimension in data/secondmates.md, gates the host on
+# fm-remote-doctor.sh readiness before touching it, sends a bounded provisioning
 # manifest through fm-on.sh, and lets the remote host clone its own Firstmate
 # home and project origins. No project tree or secret environment is copied.
+#
+# Each project needs an origin the remote account can clone. Firstmate resolves
+# that origin and names it as <project>=<origin-url>, so seeding never requires
+# a clone of that project in this home; a bare <project> is accepted only when
+# this home already has projects/<project>, whose origin is then read instead.
+# bin/fm-project-origin-lib.sh owns which URLs are accepted, and this home's
+# data/projects.md still owns the project's registered delivery mode, so an
+# unregistered or local-only project is refused rather than provisioned.
+# Seeding writes nothing under projects/ and needs no fleet sync first.
+#
 # Known provisioning failure rolls the registry back. SSH status 255 preserves
-# the route because completion is unknown and a same-route rerun converges.
+# the route and any newly scaffolded brief because completion is unknown and a same-route rerun converges.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,9 +39,13 @@ MAX_MANIFEST_BYTES=1048576
 . "$SCRIPT_DIR/fm-secondmate-charter-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-remote-readiness-lib.sh
+. "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-project-origin-lib.sh
+. "$SCRIPT_DIR/fm-project-origin-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 encode() { base64 | tr -d '\n'; }
 safe_id() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
 
@@ -66,12 +81,21 @@ case "$REMOTE_ROOT/" in "$REMOTE_HOME/"*) die "remote code root must not be insi
 
 NO_PROJECTS=0
 PROJECT_NAMES=()
+PROJECT_ORIGINS=()
 for arg in "$@"; do
   if [ "$arg" = --no-projects ]; then
     NO_PROJECTS=1
   else
-    safe_id "$arg" || die "invalid project name: $arg"
-    PROJECT_NAMES+=("$arg")
+    name=${arg%%=*}
+    origin=
+    case "$arg" in *=*) origin=${arg#*=} ;; esac
+    safe_id "$name" || die "invalid project name: $name"
+    case "$arg" in
+      *=*) fm_project_origin_safe "$origin" \
+        || die "project $name origin is not an accepted clone URL: $origin" ;;
+    esac
+    PROJECT_NAMES+=("$name")
+    PROJECT_ORIGINS+=("$origin")
   fi
 done
 if [ "$NO_PROJECTS" -eq 1 ]; then
@@ -132,9 +156,10 @@ done < "$BRIEF" > "$TMP/charter.remote"
 
 PROJECTS_CSV=
 : > "$TMP/project.records"
+PROJECT_INDEX=0
 for project in "${PROJECT_NAMES[@]}"; do
-  SRC="$PROJECTS/$project"
-  [ -d "$SRC/.git" ] || die "project clone is unavailable: $SRC"
+  ORIGIN=${PROJECT_ORIGINS[$PROJECT_INDEX]}
+  PROJECT_INDEX=$((PROJECT_INDEX + 1))
   MODE_LINE=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" "$SCRIPT_DIR/fm-project-mode.sh" "$project")
   read -r MODE _ <<EOF
 $MODE_LINE
@@ -144,9 +169,17 @@ EOF
     local-only) die "project $project is local-only and cannot be provisioned remotely" ;;
     *) die "project $project has unsupported delivery mode: $MODE" ;;
   esac
-  ORIGIN=$(git -C "$SRC" remote get-url origin 2>/dev/null || true)
-  [ -n "$ORIGIN" ] || die "project $project has no origin remote"
-  REGISTRY_LINE=$(awk -v p="$project" '$1 == "-" && $2 == p { print; exit }' "$DATA/projects.md")
+  # An origin named on the command line is authoritative. Reading one from a
+  # clone this home happens to have is only a convenience for the already-cloned
+  # case; it is never a reason to create one.
+  if [ -z "$ORIGIN" ] && [ -d "$PROJECTS/$project/.git" ]; then
+    ORIGIN=$(git -C "$PROJECTS/$project" remote get-url origin 2>/dev/null || true)
+  fi
+  [ -n "$ORIGIN" ] \
+    || die "project $project has no origin; pass $project=<origin-url> so the remote host can clone it"
+  fm_project_origin_safe "$ORIGIN" \
+    || die "project $project origin is not an accepted clone URL: $ORIGIN"
+  REGISTRY_LINE=$(awk -v p="$project" '$1 == "-" && $2 == p { print; exit }' "$DATA/projects.md" 2>/dev/null || true)
   [ -n "$REGISTRY_LINE" ] || die "project $project has no registry record"
   NAME_B64=$(printf '%s' "$project" | encode)
   ORIGIN_B64=$(printf '%s' "$ORIGIN" | encode)
@@ -160,6 +193,13 @@ done
   printf 'schema=fm-remote-home-provision.v1\n'
   printf 'id_b64=%s\n' "$(printf '%s' "$ID" | encode)"
   printf 'charter_b64=%s\n' "$(encode < "$TMP/charter.remote")"
+  # The SSH alias reaching this host from the parent's own config, carried
+  # only so the remote-provisioned home can record durably that its parent
+  # lives on another machine (bin/fm-teardown.sh's cleanup gate). It is
+  # diagnostic identity, never a route the remote host could use to reach
+  # back; the parent's real filesystem path is never sent, since it names
+  # nothing on the remote filesystem.
+  printf 'parent_host_b64=%s\n' "$(printf '%s' "$HOST" | encode)"
   printf 'project_count=%s\n' "${#PROJECT_NAMES[@]}"
   cat "$TMP/project.records"
 } > "$TMP/manifest"
@@ -178,14 +218,36 @@ if ! secondmate_registry_validate_bindings "$REG" secondmate_registry_path_key "
   die "$SECONDMATE_REGISTRY_ERROR"
 fi
 
+restore_registry_and_brief() {
+  if [ "$REG_EXISTED" -eq 1 ]; then cp "$TMP/registry.before" "$REG"; else rm -f -- "$REG"; fi
+  [ "$BRIEF_CREATED" -eq 0 ] || rm -f -- "$BRIEF"
+}
+
+# Preflight and, where it can, repair the remote runtime before anything is
+# created on that host. The doctor runs through the same fixed entrypoint as
+# every later call, so it sees the exact PATH the remote home will run under.
+set +e
+fm_remote_readiness_ensure "$SCRIPT_DIR" "$ID"
+PREFLIGHT_RC=$?
+set -e
+if [ "$PREFLIGHT_RC" -ne 0 ]; then
+  if [ "$PREFLIGHT_RC" -ne 255 ]; then
+    restore_registry_and_brief
+  fi
+  [ -z "$FM_REMOTE_READINESS_OUT" ] || printf '%s\n' "$FM_REMOTE_READINESS_OUT" >&2
+  if [ "$PREFLIGHT_RC" -eq 255 ]; then
+    die "remote readiness completion is unknown; route and brief preserved for same-host reconciliation"
+  fi
+  die "remote runtime preflight failed; nothing was provisioned. Close the gaps listed above, or update the remote code root if it predates the current fm-remote-doctor.sh"
+fi
+
 set +e
 PROVISION_OUT=$("$SCRIPT_DIR/fm-on.sh" "$ID" fm-remote-home-provision.sh < "$TMP/manifest" 2>&1)
 PROVISION_RC=$?
 set -e
 if [ "$PROVISION_RC" -ne 0 ]; then
   if [ "$PROVISION_RC" -ne 255 ]; then
-    if [ "$REG_EXISTED" -eq 1 ]; then cp "$TMP/registry.before" "$REG"; else rm -f -- "$REG"; fi
-    [ "$BRIEF_CREATED" -eq 0 ] || rm -f -- "$BRIEF"
+    restore_registry_and_brief
   fi
   [ -z "$PROVISION_OUT" ] || printf '%s\n' "$PROVISION_OUT" >&2
   if [ "$PROVISION_RC" -eq 255 ]; then
