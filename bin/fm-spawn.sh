@@ -2586,6 +2586,12 @@ if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
   META_BODY="${META_BODY}control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX
 "
 fi
+if [ -e "$STATE/$ID.meta" ] && [ ! -f "$STATE/$ID.meta" ]; then
+  # A rename onto a directory would move the temp record *inside* it and
+  # report success, leaving a live task with no readable meta record.
+  echo "error: cannot publish task metadata at $STATE/$ID.meta: Is a directory or not a regular file; aborting the spawn" >&2
+  exit 1
+fi
 if ! printf '%s' "$META_BODY" > "$SPAWN_META_TMP"; then
   echo "error: cannot publish task metadata at $STATE/$ID.meta; aborting the spawn" >&2
   exit 1
