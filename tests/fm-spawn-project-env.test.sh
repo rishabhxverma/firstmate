@@ -79,7 +79,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$wt" \
     PATH="$fakebin:$PATH" \
-    "$SPAWN" "$id" "$proj" 2>&1
+    "$SPAWN" "$id" "$proj" --mode no-mistakes --yolo off 2>&1
 }
 
 test_fresh_worktree_gets_the_declared_env_at_spawn_time() {
