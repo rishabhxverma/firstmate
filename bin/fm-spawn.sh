@@ -2497,13 +2497,13 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
-SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
   fm_lock_acquire_wait "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
   SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
-  SPAWN_META_PATH=$SPAWN_META_TMP
+else
+  SPAWN_META_TMP="$STATE/.$ID.meta.publish.${BASHPID:-$$}"
 fi
 preserve_relaunch_meta() {
   awk -F= '
@@ -2516,64 +2516,90 @@ preserve_relaunch_meta() {
 }
 # Metadata publication is the point where the task becomes recoverable, so a
 # failed write must abort the spawn and let the EXIT trap release the backend's
-# resources. The `|| exit` is explicit rather than left to `set -e`: stock macOS
+# resources. The body is accumulated in memory and flushed with a single
+# checked `printf` into a temp file, then renamed into place: a brace group's
+# status is only its last command's, so a mid-group write failure (ENOSPC,
+# EDQUOT) would otherwise leave truncated metadata behind and still report
+# success. The checks are explicit rather than left to `set -e`: stock macOS
 # Bash 3.2 does not treat a redirection failure on a COMPOUND command as an
-# errexit trigger, so relying on it would let a spawn report success while its
-# metadata was never written.
-{
-  echo "window=$META_WINDOW"
-  echo "endpoint_task_id=$ID"
-  echo "worktree=$WT"
-  echo "project=$PROJ_ABS"
-  echo "harness=$HARNESS"
-  echo "kind=$KIND"
-  [ -z "$MODE" ] || echo "mode=$MODE"
-  [ -z "$YOLO" ] || echo "yolo=$YOLO"
-  echo "tasktmp=$TASK_TMP"
-  echo "model=${MODEL:-default}"
-  echo "effort=${EFFORT:-default}"
-  [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
-  # Default-off writes no traceparent= line.
-  # backend= is written only for a non-default (non-tmux) backend, so the
-  # default path's meta stays byte-identical (absent backend= means tmux;
-  # data/fm-backend-design-d7's P1 compatibility contract).
-  [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
-  if [ "$BACKEND" = herdr ]; then
-    echo "herdr_session=$HERDR_SES"
-    echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
-    echo "herdr_tab_id=$HERDR_TAB_ID"
-    echo "herdr_pane_id=$HERDR_PANE_ID"
-  fi
-  if [ "$BACKEND" = zellij ]; then
-    echo "zellij_session=$ZELLIJ_SES"
-    echo "zellij_tab_id=$ZELLIJ_TAB_ID"
-    echo "zellij_pane_id=$ZELLIJ_PANE_ID"
-  fi
-  if [ "$BACKEND" = orca ]; then
-    echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-    echo "terminal=$ORCA_TERMINAL"
-  fi
-  if [ "$BACKEND" = cmux ]; then
-    echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
-    echo "cmux_surface_id=$CMUX_SURFACE_ID"
-  fi
-  if [ "$KIND" = secondmate ]; then
-    echo "home=$PROJ_ABS"
-    echo "projects=$SECONDMATE_PROJECTS"
-  fi
-  if [ "$RELAUNCH" -eq 1 ]; then
-    preserve_relaunch_meta
-  fi
-  if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
-    echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
-  fi
-} > "$SPAWN_META_PATH" || { echo "error: cannot publish task metadata at $SPAWN_META_PATH; aborting the spawn" >&2; exit 1; }
+# errexit trigger.
+META_BODY="window=$META_WINDOW
+endpoint_task_id=$ID
+worktree=$WT
+project=$PROJ_ABS
+harness=$HARNESS
+kind=$KIND
+"
+[ -z "$MODE" ] || META_BODY="${META_BODY}mode=$MODE
+"
+[ -z "$YOLO" ] || META_BODY="${META_BODY}yolo=$YOLO
+"
+META_BODY="${META_BODY}tasktmp=$TASK_TMP
+model=${MODEL:-default}
+effort=${EFFORT:-default}
+"
+[ -z "${BUSY_GEN:-}" ] || META_BODY="${META_BODY}busy_gen=$BUSY_GEN
+"
+# Default-off writes no traceparent= line.
+# backend= is written only for a non-default (non-tmux) backend, so the
+# default path's meta stays byte-identical (absent backend= means tmux;
+# data/fm-backend-design-d7's P1 compatibility contract).
+[ "$BACKEND" = tmux ] || META_BODY="${META_BODY}backend=$BACKEND
+"
+if [ "$BACKEND" = herdr ]; then
+  META_BODY="${META_BODY}herdr_session=$HERDR_SES
+herdr_workspace_id=$HERDR_WORKSPACE_ID
+herdr_tab_id=$HERDR_TAB_ID
+herdr_pane_id=$HERDR_PANE_ID
+"
+fi
+if [ "$BACKEND" = zellij ]; then
+  META_BODY="${META_BODY}zellij_session=$ZELLIJ_SES
+zellij_tab_id=$ZELLIJ_TAB_ID
+zellij_pane_id=$ZELLIJ_PANE_ID
+"
+fi
+if [ "$BACKEND" = orca ]; then
+  META_BODY="${META_BODY}orca_worktree_id=$ORCA_WORKTREE_ID
+terminal=$ORCA_TERMINAL
+"
+fi
+if [ "$BACKEND" = cmux ]; then
+  META_BODY="${META_BODY}cmux_workspace_id=$CMUX_WORKSPACE_ID
+cmux_surface_id=$CMUX_SURFACE_ID
+"
+fi
+if [ "$KIND" = secondmate ]; then
+  META_BODY="${META_BODY}home=$PROJ_ABS
+projects=$SECONDMATE_PROJECTS
+"
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
-  SPAWN_META_PUBLISH_STARTED=1
-  mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"
-  RELAUNCH_REPLACEMENT_PENDING=0
+  META_PRESERVED=$(preserve_relaunch_meta) || {
+    echo "error: cannot read preserved metadata for $ID; aborting the spawn" >&2
+    exit 1
+  }
+  [ -z "$META_PRESERVED" ] || META_BODY="${META_BODY}${META_PRESERVED}
+"
+fi
+if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
+  META_BODY="${META_BODY}control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX
+"
+fi
+if ! printf '%s' "$META_BODY" > "$SPAWN_META_TMP"; then
+  echo "error: cannot publish task metadata at $STATE/$ID.meta; aborting the spawn" >&2
+  exit 1
+fi
+SPAWN_META_PUBLISH_STARTED=1
+if ! mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"; then
   SPAWN_META_PUBLISH_STARTED=0
-  SPAWN_META_TMP=
+  echo "error: cannot publish task metadata at $STATE/$ID.meta; aborting the spawn" >&2
+  exit 1
+fi
+RELAUNCH_REPLACEMENT_PENDING=0
+SPAWN_META_PUBLISH_STARTED=0
+SPAWN_META_TMP=
+if [ "$SPAWN_META_LOCK_HELD" = 1 ]; then
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
 fi
