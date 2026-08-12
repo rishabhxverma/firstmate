@@ -1310,17 +1310,36 @@ handle_wake() {  # <reason> <state>
 # directly and pass state explicitly, so they do not call log).
 log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG"; }
 
+# Shrink $1 to exactly $2 bytes, preferring truncate(1) and falling back to
+# perl where it is absent. Returns non-zero when neither tool can do it.
+truncate_file_to() {
+  if command -v truncate >/dev/null 2>&1; then
+    truncate -s "$2" "$1" 2>/dev/null
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$1" "$2" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 trim_log() {
-  local sz tmp
+  local sz tmp kept
   [ -n "${LOG:-}" ] || return 0
   sz=$(wc -c < "$LOG" 2>/dev/null) || return 0
   [ "$sz" -ge "${FM_LOG_MAX_BYTES:-$LOG_MAX_BYTES_DEFAULT}" ] || return 0
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-daemon-log.XXXXXX") || return 0
   # Written back IN PLACE rather than mv'd over: the daemon's stderr is bound to
   # this file's inode (exec 2>>"$LOG"), so replacing the inode would silently
-  # send every later bash error to an unlinked file.
+  # send every later bash error to an unlinked file. Overwrite-then-truncate
+  # rather than a plain > redirection: the log is read (bin/fm-afk-health.sh
+  # tails it) at exactly the moment a daemon is dying, so it must never be
+  # observably empty.
   if tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null; then
-    cat "$tmp" > "$LOG" 2>/dev/null || true
+    kept=$(wc -c < "$tmp" 2>/dev/null | tr -d '[:space:]')
+    case $kept in ''|*[!0-9]*) kept= ;; esac
+    if [ -n "$kept" ] && cat "$tmp" 1<>"$LOG" 2>/dev/null; then
+      truncate_file_to "$LOG" "$kept" || true
+    fi
   fi
   rm -f "$tmp" 2>/dev/null || true
 }

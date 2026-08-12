@@ -725,10 +725,12 @@ subsection "AFK"
 if [ -e "$STATE/.afk" ]; then
   if AFK_HEALTH=$("$SCRIPT_DIR/fm-afk-health.sh" 2>&1); then
     case "$AFK_HEALTH" in
+      AFK_HEALTHY*)
+        printf 'present - away-mode supervision is active; the daemon owns the watcher.\n' ;;
       AFK_STARTING*)
         printf 'present - away mode is still arming, not yet supervising.\n' ;;
       *)
-        printf 'present - away-mode supervision is active; the daemon owns the watcher.\n' ;;
+        printf 'present but NOT SUPERVISED - the away-mode flag is set and no daemon is triaging.\n' ;;
     esac
     printf '%s\n' "$AFK_HEALTH"
   else

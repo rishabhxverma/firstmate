@@ -36,7 +36,7 @@ fm_sup_stat_mtime() {
 # grace-seconds defaults to $FM_GUARD_GRACE, then 300, matching fm-guard.sh.
 # Always returns 0; callers read the vars, or use fm_supervision_unhealthy below.
 fm_supervision_status() {
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} meta source beat m age
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} meta source beat m now age
   FM_SUP_IN_FLIGHT=0
   FM_SUP_NEEDED=false
   FM_SUP_WATCHER_FRESH=false
@@ -60,9 +60,14 @@ fm_supervision_status() {
 
   beat="$state/.last-watcher-beat"
   if [ -e "$beat" ]; then
+    # An mtime is trusted only when its OUTPUT parses, never on exit status
+    # alone; fm_path_age in bin/fm-wake-lib.sh owns that contract in full.
     m=$(fm_sup_stat_mtime "$beat")
-    if [ -n "$m" ]; then
-      age=$(( $(date +%s) - m ))
+    case $m in ''|*[!0-9]*) m= ;; esac
+    now=$(date +%s) || now=
+    case $now in ''|*[!0-9]*) now= ;; esac
+    if [ -n "$m" ] && [ -n "$now" ]; then
+      age=$(( now - m ))
       FM_SUP_BEACON_DESC="${age}s ago"
       [ "$age" -lt "$grace" ] && FM_SUP_WATCHER_FRESH=true
     else
