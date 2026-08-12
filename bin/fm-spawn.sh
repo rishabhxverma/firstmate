@@ -2514,6 +2514,12 @@ preserve_relaunch_meta() {
     !($1 in owned)
   ' "$RELAUNCH_META"
 }
+# Metadata publication is the point where the task becomes recoverable, so a
+# failed write must abort the spawn and let the EXIT trap release the backend's
+# resources. The `|| exit` is explicit rather than left to `set -e`: stock macOS
+# Bash 3.2 does not treat a redirection failure on a COMPOUND command as an
+# errexit trigger, so relying on it would let a spawn report success while its
+# metadata was never written.
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
@@ -2561,7 +2567,7 @@ preserve_relaunch_meta() {
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH"
+} > "$SPAWN_META_PATH" || { echo "error: cannot publish task metadata at $SPAWN_META_PATH; aborting the spawn" >&2; exit 1; }
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
   mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"
