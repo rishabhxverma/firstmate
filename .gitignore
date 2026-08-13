@@ -10,3 +10,9 @@ __pycache__/
 *.pyc
 .env
 config/
+# machine-local Firecrawl scrape cache, runtime data rather than source
+.firecrawl/
+# vendored skill's demo/eval assets (~14MB); nothing in that skill loads them at
+# runtime, and its own .skillignore classifies them as non-runtime material, so a
+# reinstall must not reintroduce them as drift
+.agents/skills/last30days/assets/
