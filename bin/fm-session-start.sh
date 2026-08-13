@@ -719,8 +719,24 @@ done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "AFK"
+# The flag alone is NOT evidence of supervision: while it exists the watcher
+# drops to one-shot and hands triage to the daemon, so a flag with a dead daemon
+# means nothing is triaging at all. bin/fm-afk-health.sh owns that verdict.
 if [ -e "$STATE/.afk" ]; then
-  printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
+  if AFK_HEALTH=$("$SCRIPT_DIR/fm-afk-health.sh" 2>&1); then
+    case "$AFK_HEALTH" in
+      AFK_HEALTHY*)
+        printf 'present - away-mode supervision is active; the daemon owns the watcher.\n' ;;
+      AFK_STARTING*)
+        printf 'present - away mode is still arming, not yet supervising.\n' ;;
+      *)
+        printf 'present but NOT SUPERVISED - the away-mode flag is set and no daemon is triaging.\n' ;;
+    esac
+    printf '%s\n' "$AFK_HEALTH"
+  else
+    printf 'present but NOT SUPERVISED - the away-mode flag is set and no daemon is triaging.\n'
+    printf '%s\n' "$AFK_HEALTH"
+  fi
 else
   printf 'absent\n'
 fi
