@@ -115,6 +115,11 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  # The away-mode liveness verdict the hook defers to, plus the arming script it
+  # sources for the daemon-lock predicate.
+  cp "$ROOT/bin/fm-afk-health.sh" "$dir/bin/fm-afk-health.sh"
+  cp "$ROOT/bin/fm-afk-start.sh" "$dir/bin/fm-afk-start.sh"
+  chmod +x "$dir/bin/fm-afk-health.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -281,6 +286,125 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
   [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+}
+
+# --- away mode: the daemon supervises, and the home lock is empty by design ---
+#
+# While state/.afk exists the away daemon runs the watcher as a one-shot child
+# and restarts it after every wake, so the home lock is empty for exactly the
+# stretch that ends in the guarded turn. These cover both directions: a live
+# away-mode supervisor must not be reported blind, and one that has died or
+# stopped polling still must be.
+
+AFK_DAEMON_PID=
+
+# A live away-mode daemon, recorded in the daemon lock the way
+# bin/fm-afk-start.sh records it. bin/fm-afk-health.sh identifies the holder by
+# its command, so a real process running a script with the daemon's own name is
+# a faithful stand-in for the liveness question without launching the daemon.
+start_fake_afk_daemon() {
+  local dir=$1 fake
+  fake="$dir/fakebin/fm-supervise-daemon.sh"
+  mkdir -p "$dir/fakebin" "$dir/state/.supervise-daemon.lock"
+  printf '#!/bin/sh\nsleep 120\n' > "$fake"
+  chmod +x "$fake"
+  "$fake" >/dev/null 2>&1 &
+  AFK_DAEMON_PID=$!
+  printf '%s\n' "$AFK_DAEMON_PID" > "$dir/state/.supervise-daemon.lock/pid"
+}
+
+stop_fake_afk_daemon() {
+  [ -n "$AFK_DAEMON_PID" ] || return 0
+  kill "$AFK_DAEMON_PID" 2>/dev/null || true
+  wait "$AFK_DAEMON_PID" 2>/dev/null || true
+  AFK_DAEMON_PID=
+}
+
+record_dead_afk_daemon() {
+  local dir=$1
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  nonexistent_pid > "$dir/state/.supervise-daemon.lock/pid"
+}
+
+test_hook_silent_when_away_daemon_supervises() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-live")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  touch "$dir/state/.subsuper-daemon-ready"
+  out=$(run_hook "$dir" false); status=$?
+  stop_fake_afk_daemon
+  expect_code 0 "$status" "a live away-mode daemon with a fresh beat is real supervision"
+  [ -z "$out" ] || fail "hook cried wolf while the away-mode daemon was supervising: $out"
+  pass "fm-turnend-guard: silent while a live away-mode daemon supervises with no watcher lock"
+}
+
+test_hook_blocks_when_away_daemon_is_dead() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-dead")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  record_dead_afk_daemon "$dir"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "away mode with a dead daemon is genuine blindness and must block"
+  assert_contains "$out" "AWAY-MODE SUPERVISION HAS STOPPED" "a dead away supervisor needs its own banner, not the watcher-lock one"
+  assert_contains "$out" "nothing is supervising it" "block must say the away supervisor is gone"
+  assert_contains "$out" 'Away mode owns watcher supervision' "block must keep the away-mode repair instruction"
+  pass "fm-turnend-guard: blocks when away mode is on but its daemon is dead"
+}
+
+test_hook_blocks_when_away_daemon_stopped_polling() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-stale-beat")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch -t 202001010000 "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  touch "$dir/state/.subsuper-daemon-ready"
+  # The freshness threshold is single-sourced from the guard's own grace window,
+  # so overriding that window must move this verdict with it.
+  out=$(FM_GUARD_GRACE=60 run_hook "$dir" false); status=$?
+  stop_fake_afk_daemon
+  expect_code 2 "$status" "a live away daemon that stopped polling is still a blind turn"
+  assert_contains "$out" "AWAY-MODE SUPERVISION HAS STOPPED" "a stalled away supervisor must use the away banner"
+  assert_contains "$out" "has not polled for supervision within 60s" "block must name the freshness threshold it applied"
+  pass "fm-turnend-guard: blocks when the away-mode daemon is alive but its watcher beat is stale"
+}
+
+test_hook_blocks_when_away_daemon_never_armed() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-unarmed")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  # No readiness beacon, and the daemon's own start evidence aged past the
+  # arming window: alive, but it never reached a triage tick.
+  touch -t 202001010000 "$dir/state/.supervise-daemon.lock"
+  out=$(run_hook "$dir" false); status=$?
+  stop_fake_afk_daemon
+  expect_code 2 "$status" "a live-but-never-armed away daemon must not count as supervision"
+  assert_contains "$out" "AWAY-MODE SUPERVISION HAS STOPPED" "an unarmed away daemon must use the away banner"
+  pass "fm-turnend-guard: a live away-mode daemon that never armed does not satisfy the guard"
+}
+
+test_hook_away_credit_requires_the_away_flag() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-no-flag")
+  : > "$dir/state/task1.meta"
+  touch "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  touch "$dir/state/.subsuper-daemon-ready"
+  out=$(run_hook "$dir" false); status=$?
+  stop_fake_afk_daemon
+  expect_code 2 "$status" "without state/.afk a daemon process must not excuse a missing watcher"
+  assert_contains "$out" "TURN WOULD END BLIND - SUPERVISION IS OFF" "non-away blindness must keep its own banner"
+  assert_contains "$out" "no live watcher holds this home lock" "non-away block lost its watcher-lock diagnosis"
+  assert_not_contains "$out" "AWAY-MODE" "a home that is not in away mode must not get the away banner"
+  pass "fm-turnend-guard: non-away homes are unchanged - only state/.afk unlocks the away verdict"
 }
 
 test_hook_non_claude_health_ignores_claude_budget_contention() {
@@ -1514,6 +1638,36 @@ test_hook_claude_mode_fail_open_requires_notice_and_failure_epoch() {
   pass "fm-turnend-guard --claude: fail-open requires both exhausted retries and consumed notice"
 }
 
+test_hook_claude_mode_silent_when_away_daemon_supervises() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-afk-live")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  touch "$dir/state/.subsuper-daemon-ready"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  stop_fake_afk_daemon
+  expect_code 0 "$status" "--claude must accept a live away-mode daemon as supervision"
+  [ -z "$out" ] || fail "--claude cried wolf while the away-mode daemon was supervising: $out"
+  assert_absent "$dir/state/.turnend-claude-blocks" "a supervised away-mode turn must not spend the bounded block budget"
+  pass "fm-turnend-guard --claude: a live away-mode daemon ends the turn silently"
+}
+
+test_hook_claude_mode_blocks_when_away_daemon_is_dead() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-afk-dead")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  record_dead_afk_daemon "$dir"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  expect_code 2 "$status" "--claude must still block when away mode has no live daemon"
+  assert_contains "$out" "AWAY-MODE SUPERVISION HAS STOPPED" "--claude away block must name the real failure"
+  assert_not_contains "$out" "The Stop-owned auto-arm did not claim this home" "the Stop auto-arm stands down in away mode by design, so naming it misdirects the repair"
+  pass "fm-turnend-guard --claude: blocks when away mode is on but its daemon is dead"
+}
+
 test_hook_claude_mode_away_mode_never_uses_stop_autoarm_fail_open() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-alarm-afk")
@@ -1610,6 +1764,11 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_source_only_home
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_silent_when_away_daemon_supervises
+test_hook_blocks_when_away_daemon_is_dead
+test_hook_blocks_when_away_daemon_stopped_polling
+test_hook_blocks_when_away_daemon_never_armed
+test_hook_away_credit_requires_the_away_flag
 test_hook_non_claude_health_ignores_claude_budget_contention
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
@@ -1658,6 +1817,8 @@ test_hook_claude_mode_stale_rewake_epoch_blocks
 test_hook_claude_mode_budget_without_verified_failure_keeps_blocking
 test_hook_claude_mode_verified_failure_alarm_is_loud_and_once
 test_hook_claude_mode_fail_open_requires_notice_and_failure_epoch
+test_hook_claude_mode_silent_when_away_daemon_supervises
+test_hook_claude_mode_blocks_when_away_daemon_is_dead
 test_hook_claude_mode_away_mode_never_uses_stop_autoarm_fail_open
 test_hook_claude_mode_allow_resets_budget
 test_hook_claude_mode_waits_for_late_claim

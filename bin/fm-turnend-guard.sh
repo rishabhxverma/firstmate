@@ -38,6 +38,20 @@
 # never a wedged, un-endable session - while still nagging again on a later turn
 # if the problem persists.
 #
+# Away mode: while state/.afk exists, bin/fm-supervise-daemon.sh owns
+# supervision and runs bin/fm-watch.sh as a one-shot child it restarts after
+# every wake, and bin/fm-claude-stop-autoarm.sh stands down entirely. So the
+# home lock is EMPTY for the whole stretch the daemon spends handling a wake -
+# which is exactly the stretch that ends in a firstmate turn. Testing lock
+# ownership there reports a blind turn on essentially every away-mode turn while
+# the daemon is triaging normally, and a guard that cries wolf every turn trains
+# the operator to ignore the one time it is right. This guard therefore asks
+# bin/fm-afk-health.sh - the single owner of "is away-mode supervision REAL" -
+# whether a daemon is live and supervising, and independently requires a
+# beat within AFK_BEAT_GRACE proving the watcher child is still polling. Away
+# mode with a dead or non-triaging supervisor still blocks, under its own banner
+# because the operator's next action differs (see docs/turnend-guard.md).
+#
 # Loop-guard, --claude mode (Stop-owned auto-arm cooperation): Claude Code
 # marks EVERY stop after ANY stop-hook-driven continuation stop_hook_active=true,
 # including turns started by the asyncRewake auto-arm, so the one-shot allow
@@ -67,6 +81,21 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
+AFK_HEALTH="$SCRIPT_DIR/fm-afk-health.sh"
+# Away-mode beat freshness window: how long state/.last-watcher-beat may go
+# untouched before a live away-mode daemon stops counting as real supervision.
+# Deliberately the SAME window as GRACE, single-sourced from it, for two
+# reasons. It has to clear away mode's longest LEGITIMATE beat gap: the daemon
+# runs its watcher child on the watcher's own poll cadence (FM_POLL, 15s) but
+# pauses it for up to CRASH_BACKOFF (60s) after a crash loop and up to
+# INJECT_FAIL_SLEEP (30s) while the escalation target is gone
+# (bin/fm-supervise-daemon.sh owns those), so anything near one poll cycle would
+# reintroduce the false alarm this check exists to remove; 300s is five of those
+# worst-case pauses. And a second knob here could drift from the staleness
+# standard every other supervision model in this guard is already judged by,
+# which would make "supervision is stale" mean two different things in one
+# banner.
+AFK_BEAT_GRACE=$GRACE
 CLAUDE_MODE=0
 SYNC_WAIT_MS=${FM_CLAUDE_AUTOARM_SYNC_WAIT_MS:-800}
 EPOCH_FRESH=${FM_CLAUDE_AUTOARM_EPOCH_FRESH:-15}
@@ -152,10 +181,60 @@ if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   exit 2
 fi
 
+# Why this home needs supervision at all, phrased to precede either banner's
+# "but ..." clause.
+supervision_need_desc() {
+  if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
+    printf '%s task(s) in flight' "$FM_SUP_IN_FLIGHT"
+  elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
+    printf '%s process-event source(s) registered' "$FM_SUP_SOURCES"
+  else
+    printf 'X-mode relay polling needs supervision'
+  fi
+}
+
+# Away-mode supervision liveness. True only when all three hold:
+#   1. state/.afk is present, so the away daemon owns supervision at all;
+#   2. bin/fm-afk-health.sh - the single owner of that verdict - reports a live
+#      daemon (AFK_HEALTHY, or AFK_STARTING inside its own bounded arming
+#      window). AFK_DEGRADED covers both a missing daemon and a live daemon that
+#      never reached its first housekeeping tick, so a wedged daemon fails here;
+#   3. the watcher beat is fresher than AFK_BEAT_GRACE, proving the daemon's
+#      one-shot watcher child is still polling. A live daemon whose watcher
+#      never runs keeps ticking housekeeping and would otherwise read healthy.
+# Anything else sets AFK_DOWN_DETAIL and returns false, so away mode with a dead
+# or stalled supervisor still blocks the turn.
+AFK_ACTIVE=0
+[ -e "$STATE/.afk" ] && AFK_ACTIVE=1
+AFK_DOWN_DETAIL='away mode is on but its supervisor could not be verified'
+afk_supervision_live() {
+  local line verdict age
+  [ "$AFK_ACTIVE" -eq 1 ] || return 1
+  if [ ! -x "$AFK_HEALTH" ]; then
+    AFK_DOWN_DETAIL="away mode is on but its health check is missing at $AFK_HEALTH, so supervision cannot be verified"
+    return 1
+  fi
+  line=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$AFK_HEALTH" 2>/dev/null | head -1)
+  verdict=${line%%:*}
+  case "$verdict" in
+    AFK_HEALTHY|AFK_STARTING) : ;;
+    *)
+      AFK_DOWN_DETAIL="away mode is on but nothing is supervising it (${line:-no verdict from $AFK_HEALTH})"
+      return 1
+      ;;
+  esac
+  age=$(fm_path_age "$STATE/.last-watcher-beat")
+  case $age in ''|*[!0-9]*) age=999999 ;; esac
+  if [ "$age" -ge "$AFK_BEAT_GRACE" ]; then
+    AFK_DOWN_DETAIL="the away-mode supervisor is alive but has not polled for supervision within ${AFK_BEAT_GRACE}s (last beat: $FM_SUP_BEACON_DESC), so nothing is triaging"
+    return 1
+  fi
+  return 0
+}
+
 block_stop() {
   local afk x_mode reason rule
-  afk=0
-  [ -e "$STATE/.afk" ] && afk=1
+  afk=$AFK_ACTIVE
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
   reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
@@ -163,22 +242,31 @@ block_stop() {
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"
-    printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-    if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
-      printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
-    elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
-      printf '●  %s process-event source(s) registered, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_SOURCES" "$FM_SUP_BEACON_DESC"
+    if [ "$AFK_ACTIVE" -eq 1 ]; then
+      # A distinct banner because the repair differs: away mode does not want a
+      # watcher armed directly, it wants its daemon back.
+      printf '●  TURN WOULD END BLIND - AWAY-MODE SUPERVISION HAS STOPPED\n'
+      printf '●  %s, and %s.\n' "$(supervision_need_desc)" "$AFK_DOWN_DETAIL"
     else
-      printf '●  X-mode relay polling needs supervision, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_BEACON_DESC"
-    fi
-    if [ "$CLAUDE_MODE" -eq 1 ]; then
-      printf '●  The Stop-owned auto-arm did not claim this home either, so recovery is NOT already under way.\n'
+      printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
+      printf '●  %s, but no live watcher holds this home lock (last beat: %s).\n' "$(supervision_need_desc)" "$FM_SUP_BEACON_DESC"
+      if [ "$CLAUDE_MODE" -eq 1 ]; then
+        printf '●  The Stop-owned auto-arm did not claim this home either, so recovery is NOT already under way.\n'
+      fi
     fi
     printf '●  %s\n' "$reason"
     printf '●%s\n' "$rule"
   } >&2
   exit 2
 }
+
+# --- away mode: the daemon supervises, so an empty home lock is not blindness -
+# Checked in BOTH modes and before either block path, because the away daemon
+# leaves the lock empty by design while it handles a wake, and the --claude
+# auto-arm deliberately stands down for the whole away session.
+if afk_supervision_live; then
+  exit 0
+fi
 
 if [ "$CLAUDE_MODE" -eq 0 ]; then
   block_stop
