@@ -15,6 +15,7 @@ Do not infer this guard's scope, loop safety, or compatibility tradeoffs for tho
 The turn-end guard closes the remaining gap at the primary's own turn boundary.
 When work, a process-event source, or Relay polling needs supervision at that boundary and no identity-matched watcher has a fresh beacon, the harness integration must either block the turn end or force one bounded follow-up that uses the recovery instruction from the emitted session-start protocol.
 The mid-turn pull warning uses the model-aware supervision verdict described below, while the turn-end guard keeps the PID-strict watcher predicate.
+While away mode owns supervision the turn-end guard asks a different question, described in "Away mode" below, because the away daemon leaves the home lock empty by design.
 The guard remains a backstop; [`watcher-continuity.md`](watcher-continuity.md) owns normal continuity.
 
 ## Guard predicates
@@ -37,8 +38,26 @@ Under the Claude Stop auto-arm model a beacon fresh within grace is healthy even
 Under every persistent-watcher harness a live identity-matched watcher with a fresh beacon is still required, so the pull guard keeps the same strict semantics there.
 Its banner names the true failing condition, either a missing live watcher process or a genuinely stale beacon with its real age, and keys the once-per-episode dedup on that condition rather than the beacon mtime.
 
+### Away mode
+
+While `state/.afk` exists, `bin/fm-supervise-daemon.sh` owns supervision, runs `bin/fm-watch.sh` as a one-shot child it restarts after every wake, and `bin/fm-claude-stop-autoarm.sh` stands down for the whole away session.
+The home lock is therefore empty for exactly the stretch the daemon spends handling a wake, which is the stretch that ends in the guarded turn, so the lock-ownership predicate above reported a blind turn on essentially every away-mode turn while the daemon was triaging normally.
+A guard that cries wolf every turn trains the operator to ignore the one time it is right, so the guard replaces that question in away mode with a three-part liveness test, in both the default and `--claude` modes and before either block path.
+
+1. `state/.afk` is present, so the away daemon owns supervision at all.
+2. `bin/fm-afk-health.sh`, the single owner of that verdict, reports `AFK_HEALTHY` or `AFK_STARTING`, its own bounded arming window.
+   `AFK_DEGRADED` covers both a missing daemon and a live daemon that never reached its first housekeeping tick.
+3. `state/.last-watcher-beat` is fresher than the beat window, proving the daemon's one-shot watcher child is still polling.
+   A live daemon whose watcher never runs keeps ticking housekeeping, so the health verdict alone cannot answer this.
+
+Failing any part still blocks the turn, under a distinct `AWAY-MODE SUPERVISION HAS STOPPED` banner that names the concrete failure, because the repair differs: away mode does not want a watcher armed directly, it wants its daemon back.
+The `--claude` away block also omits the Stop auto-arm line, since that auto-arm stands down in away mode by design.
+Passing all three parts is positive recovery in `--claude` mode, so it clears the failure episode described under "Claude mode" before ending the turn.
+
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repository-root `state/`.
 `FM_GUARD_GRACE` controls beacon freshness and defaults to 300 seconds.
+The away-mode beat window is `AFK_BEAT_GRACE`, single-sourced from that same grace rather than a second knob, so one staleness standard governs every supervision model in the guard.
+Its derivation from the away daemon's own longest legitimate pause between beats is recorded at the constant in `bin/fm-turnend-guard.sh`.
 If `jq` is missing or hook stdin is empty, the guard exits 0 because it cannot safely read loop-guard fields.
 
 ## Harness integrations
@@ -66,7 +85,7 @@ Fresh `failed` and `failed-suppressed` outcomes enter or advance the failure pro
 The auto-arm itself rechecks the healthy watcher predicate and retries a bounded number of times before reporting a genuine failure.
 The first fresh exhausted-failure epoch preserves its handoff without consuming a blocked-stop count, while later fresh failed epochs advance the same monotonic progression instead of resetting it.
 When none of those proofs appears, it re-blocks up to `FM_CLAUDE_TURNEND_BLOCK_BUDGET` times (default 3, below Claude's 8-block override).
-In Claude mode, positive watcher recovery clears the block budget, failure notice, and attended alarm together under the existing budget lock before either hook reports ordinary recovery.
+In Claude mode, positive watcher recovery - either a healthy watcher or verified live away-mode supervision, which count as the same class of positive verdict - clears the block budget, failure notice, and attended alarm together under the existing budget lock before either hook reports ordinary recovery.
 The one loud attended fail-open is available only when the auto-arm has recorded an exhausted failure, its one notice is already consumed, the block budget is exhausted, and a final check finds neither a healthy watcher nor an automatic continuation.
 Each epoch identity is accounted at most once under the budget lock.
 Whenever both coordination locks are needed, positive auto-arm recovery and the terminal check acquire the auto-arm owner lock before the budget lock.
@@ -97,6 +116,8 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it alwa
 
 - Child crewmate and scout worktrees are outside scope.
 - A valid secondmate home is in scope; an idle secondmate endpoint with no Relay poll remains healthy because it has no supervision need.
+- An away-mode home blocks until its first watcher beat lands, so entering away mode can cost one banner before the daemon's watcher child has polled once.
+  That direction is deliberate: the beat is the only evidence that anything is actually polling, and tolerating its absence would reopen a real blind window to save a single line.
 - The direct-blocking and bounded passive-follow-up split is limited to the primary integrations listed above.
 - OpenCode headless mode and untrusted Grok project hooks remain fail-open at the host boundary.
 - Kimi Code CLI 0.29.1 exposes only global `[[hooks]]` configuration in `~/.kimi-code/config.toml`, including a `Stop` event with snake_case payload fields `hook_event_name`, `session_id`, `cwd`, and `stop_hook_active`.
@@ -110,7 +131,7 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it alwa
 
 ## Regression coverage
 
-`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
+`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, both directions of the away-mode liveness test in each mode (a live supervising daemon stays silent, while a dead daemon, a stalled beat, and a never-armed daemon each still block), the negative control proving only `state/.afk` unlocks that verdict, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
 `tests/fm-guard-stale-banner.test.sh` covers the pull-guard predicate, including the persistent-model fresh-leftover-beacon negative control, the auto-arm model's healthy fresh-beacon-without-a-watcher case and its stale-beacon alarm, the true-reason banner wording, and the reason-keyed episode dedup surviving a beacon mtime change.
 `tests/fm-kimi-harness.test.sh` covers the separate Kimi crew hook's format preservation, idempotence, refusal cases, token guard, spawn registration, and teardown cleanup.
 `tests/fm-supervision-instructions.test.sh` covers recovery-line ownership and pi-signed's identity-preserving reuse of Pi's protocol.
