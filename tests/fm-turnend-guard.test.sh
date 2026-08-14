@@ -1654,6 +1654,27 @@ test_hook_claude_mode_silent_when_away_daemon_supervises() {
   pass "fm-turnend-guard --claude: a live away-mode daemon ends the turn silently"
 }
 
+test_hook_claude_mode_away_supervision_clears_failure_episode() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-afk-episode-reset")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  touch "$dir/state/.last-watcher-beat"
+  start_fake_afk_daemon "$dir"
+  touch "$dir/state/.subsuper-daemon-ready"
+  seed_claude_failure "$dir"
+  seed_claude_budget "$dir" 3
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  stop_fake_afk_daemon
+  expect_code 0 "$status" "verified away-mode supervision must end the turn silently"
+  [ -z "$out" ] || fail "--claude cried wolf while the away-mode daemon was supervising: $out"
+  assert_absent "$dir/state/.turnend-claude-blocks" "away-mode recovery must clear the stale block budget"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "away-mode recovery must clear the stale failure notice"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "away-mode recovery must clear the stale attended alarm"
+  pass "fm-turnend-guard --claude: verified away-mode supervision clears the failure episode"
+}
+
 test_hook_claude_mode_blocks_when_away_daemon_is_dead() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-afk-dead")
@@ -1818,6 +1839,7 @@ test_hook_claude_mode_budget_without_verified_failure_keeps_blocking
 test_hook_claude_mode_verified_failure_alarm_is_loud_and_once
 test_hook_claude_mode_fail_open_requires_notice_and_failure_epoch
 test_hook_claude_mode_silent_when_away_daemon_supervises
+test_hook_claude_mode_away_supervision_clears_failure_episode
 test_hook_claude_mode_blocks_when_away_daemon_is_dead
 test_hook_claude_mode_away_mode_never_uses_stop_autoarm_fail_open
 test_hook_claude_mode_allow_resets_budget

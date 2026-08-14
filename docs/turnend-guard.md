@@ -52,6 +52,7 @@ A guard that cries wolf every turn trains the operator to ignore the one time it
 
 Failing any part still blocks the turn, under a distinct `AWAY-MODE SUPERVISION HAS STOPPED` banner that names the concrete failure, because the repair differs: away mode does not want a watcher armed directly, it wants its daemon back.
 The `--claude` away block also omits the Stop auto-arm line, since that auto-arm stands down in away mode by design.
+Passing all three parts is positive recovery in `--claude` mode, so it clears the failure episode described under "Claude mode" before ending the turn.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repository-root `state/`.
 `FM_GUARD_GRACE` controls beacon freshness and defaults to 300 seconds.
@@ -84,7 +85,7 @@ Fresh `failed` and `failed-suppressed` outcomes enter or advance the failure pro
 The auto-arm itself rechecks the healthy watcher predicate and retries a bounded number of times before reporting a genuine failure.
 The first fresh exhausted-failure epoch preserves its handoff without consuming a blocked-stop count, while later fresh failed epochs advance the same monotonic progression instead of resetting it.
 When none of those proofs appears, it re-blocks up to `FM_CLAUDE_TURNEND_BLOCK_BUDGET` times (default 3, below Claude's 8-block override).
-In Claude mode, positive watcher recovery clears the block budget, failure notice, and attended alarm together under the existing budget lock before either hook reports ordinary recovery.
+In Claude mode, positive watcher recovery - either a healthy watcher or verified live away-mode supervision, which count as the same class of positive verdict - clears the block budget, failure notice, and attended alarm together under the existing budget lock before either hook reports ordinary recovery.
 The one loud attended fail-open is available only when the auto-arm has recorded an exhausted failure, its one notice is already consumed, the block budget is exhausted, and a final check finds neither a healthy watcher nor an automatic continuation.
 Each epoch identity is accounted at most once under the budget lock.
 Whenever both coordination locks are needed, positive auto-arm recovery and the terminal check acquire the auto-arm owner lock before the budget lock.

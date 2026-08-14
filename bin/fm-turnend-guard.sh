@@ -265,7 +265,9 @@ block_stop() {
 # leaves the lock empty by design while it handles a wake, and the --claude
 # auto-arm deliberately stands down for the whole away session.
 if afk_supervision_live; then
-  exit 0
+  [ "$CLAUDE_MODE" -eq 1 ] || exit 0
+  fm_failure_episode_reset "$STATE" && exit 0
+  exit 2
 fi
 
 if [ "$CLAUDE_MODE" -eq 0 ]; then
