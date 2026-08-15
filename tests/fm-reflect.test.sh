@@ -64,9 +64,17 @@ run_reflect() {  # <case-dir> [task-id]
 
 # Snapshot every path under a directory with its size and mtime, so a later
 # comparison catches a created, deleted, or rewritten file.
+#
+# GNU stat's -f means --file-system, not a format string, and it tolerates the
+# unknown BSD directives instead of failing - so probing BSD-first would silently
+# snapshot filesystem free space on Linux and report every run as a write. Probe
+# for GNU's -c first, which BSD stat rejects outright.
 snapshot_tree() {  # <dir>
-  find "$1" -exec stat -f '%N %z %m' {} + 2>/dev/null \
-    || find "$1" -exec stat -c '%n %s %Y' {} + 2>/dev/null
+  if stat -c '%n %s %Y' "$1" >/dev/null 2>&1; then
+    find "$1" -exec stat -c '%n %s %Y' {} +
+  else
+    find "$1" -exec stat -f '%N %z %m' {} +
+  fi | sort
 }
 
 wake_lines() {  # <case-dir>
