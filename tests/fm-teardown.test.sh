@@ -49,6 +49,14 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#
+# Also covers the reflection harvest teardown runs before it destroys the records
+# reflection reads (bin/fm-reflect.sh, "Fix 0" in bin/fm-teardown.sh):
+#   (z1) landed ship task       -> material captured, then records destroyed
+#   (z2) harvest exits non-zero -> teardown still completes, note printed
+#   (z3) harvest hangs          -> bounded and killed, teardown completes
+#   (z4) unlanded work          -> REFUSE before the harvest, work untouched
+#   (z5) no task data dir       -> harvest inert, teardown unchanged
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -2591,7 +2599,181 @@ EOF
   pass "the run abort and the leaked-process reap both complete before the destructive worktree return"
 }
 
+# --- reflection harvest (Fix 0) ---------------------------------------------
+#
+# Teardown harvests the task's reflection material before it destroys the event
+# log, the metadata, and the isolated copy that reflection reads. The harvest is
+# bounded and best effort in both directions, so these cases pin that it really
+# runs, and that neither a failing nor a hanging harvest can block teardown,
+# discard work, or leave the task half torn down.
+
+# run_teardown with a sandboxed data dir plus caller-supplied environment. The
+# shared run_teardown deliberately leaves FM_DATA_OVERRIDE unset, which points
+# DATA at a directory holding no data/task-x1/ and so keeps every other case in
+# this file inert for the harvest.
+run_teardown_reflect() {  # <case-dir> [VAR=value...]
+  local case_dir=$1; shift
+  env FM_ROOT_OVERRIDE="$ROOT" \
+      FM_STATE_OVERRIDE="$case_dir/state" \
+      FM_CONFIG_OVERRIDE="$case_dir/config" \
+      FM_DATA_OVERRIDE="$case_dir/data" \
+      PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
+      "$@" "$TEARDOWN" task-x1
+}
+
+# Give the task the durable data dir every real task has (bin/fm-brief.sh creates
+# it), which is the harvest's precondition.
+add_task_data_dir() {  # <case-dir>
+  mkdir -p "$1/data/task-x1"
+  printf 'the brief\n' > "$1/data/task-x1/brief.md"
+}
+
+test_teardown_harvests_reflection_before_destroying_the_records() {
+  local case_dir rc=0 out
+  case_dir=$(make_case reflect-harvest)
+  write_meta "$case_dir" local-only ship
+  add_task_data_dir "$case_dir"
+  printf 'working: setup done\nblocked: needed a credential\ndone: landed\n' \
+    > "$case_dir/state/task-x1.status"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  run_teardown_reflect "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "reflect-harvest: teardown should succeed"
+
+  out="$case_dir/data/task-x1/reflection.md"
+  assert_present "$out" "reflect-harvest: teardown published no reflection material"
+  # These records are gone now; the harvest is the only reason they survive.
+  assert_absent "$case_dir/state/task-x1.status" \
+    "reflect-harvest: teardown did not remove the event log"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "reflect-harvest: teardown did not remove the task metadata"
+  assert_grep 'blocked: needed a credential' "$out" \
+    "reflect-harvest: the destroyed event log was not captured"
+  assert_grep 'fix the thing' "$out" \
+    "reflect-harvest: the destroyed branch history was not captured"
+  assert_grep 'reflection:task-x1' "$case_dir/state/.wake-queue" \
+    "reflect-harvest: no fold-in wake was queued"
+  pass "teardown harvests the reflection material before destroying the records it reads"
+}
+
+test_failing_reflection_never_blocks_teardown() {
+  local case_dir rc=0
+  case_dir=$(make_case reflect-fails)
+  write_meta "$case_dir" local-only ship
+  add_task_data_dir "$case_dir"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  cat > "$case_dir/fakebin/false-reflect" <<'SH'
+#!/usr/bin/env bash
+echo "reflection blew up" >&2
+exit 9
+SH
+  chmod +x "$case_dir/fakebin/false-reflect"
+
+  run_teardown_reflect "$case_dir" FM_REFLECT_CMD="$case_dir/fakebin/false-reflect" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "reflect-fails: a failing harvest must not fail teardown"
+  assert_grep 'reflection capture for task-x1 failed' "$case_dir/stderr" \
+    "reflect-fails: teardown did not report the failed harvest"
+  assert_no_grep 'REFUSED' "$case_dir/stderr" \
+    "reflect-fails: a failing harvest turned into a refusal"
+  # The task is fully torn down, not left half-cleaned.
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "reflect-fails: teardown left the task metadata behind"
+  assert_absent "$case_dir/state/task-x1.status" \
+    "reflect-fails: teardown left the event log behind"
+  pass "a failing reflection harvest never blocks teardown or leaves the task half torn down"
+}
+
+test_hanging_reflection_never_blocks_teardown() {
+  local case_dir rc=0 started elapsed
+  case_dir=$(make_case reflect-hangs)
+  write_meta "$case_dir" local-only ship
+  add_task_data_dir "$case_dir"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  cat > "$case_dir/fakebin/hang-reflect" <<EOF
+#!/usr/bin/env bash
+: > "$case_dir/reflect-started"
+sleep 300
+: > "$case_dir/reflect-finished"
+EOF
+  chmod +x "$case_dir/fakebin/hang-reflect"
+
+  started=$(date +%s)
+  run_teardown_reflect "$case_dir" \
+    FM_REFLECT_CMD="$case_dir/fakebin/hang-reflect" FM_REFLECT_TIMEOUT_SECS=2 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  expect_code 0 "$rc" "reflect-hangs: a hanging harvest must not fail teardown"
+  assert_present "$case_dir/reflect-started" "reflect-hangs: the harvest never ran"
+  assert_absent "$case_dir/reflect-finished" \
+    "reflect-hangs: the harvest outlived its bound instead of being killed"
+  [ "$elapsed" -lt 60 ] || fail \
+    "reflect-hangs: teardown took ${elapsed}s, so the harvest's 2s bound did not hold"
+  assert_grep 'hit its 2s bound' "$case_dir/stderr" \
+    "reflect-hangs: teardown did not report the bounded harvest"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "reflect-hangs: teardown left the task metadata behind"
+  pass "a hanging reflection harvest is bounded and never blocks teardown"
+}
+
+# The harvest sits after every landed-work and dirty refusal, so a refused
+# teardown never reaches it and the work it protects is untouched.
+test_refused_teardown_never_harvests_and_never_discards() {
+  local case_dir rc=0 head
+  case_dir=$(make_case reflect-refused)
+  write_meta "$case_dir" local-only ship
+  add_task_data_dir "$case_dir"
+  wt_commit_file "$case_dir" unlanded.txt "work nobody has" "unlanded work"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+
+  run_teardown_reflect "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  [ "$rc" -ne 0 ] || fail "reflect-refused: teardown should have refused unlanded work"
+  assert_grep 'REFUSED' "$case_dir/stderr" "reflect-refused: no refusal was printed"
+  assert_absent "$case_dir/data/task-x1/reflection.md" \
+    "reflect-refused: a refused teardown still harvested"
+  # The unlanded work and its records are all still exactly where they were.
+  [ "$(git -C "$case_dir/wt" rev-parse HEAD)" = "$head" ] || fail \
+    "reflect-refused: the unlanded commit moved"
+  assert_present "$case_dir/wt/unlanded.txt" "reflect-refused: the unlanded file was destroyed"
+  assert_present "$case_dir/state/task-x1.meta" "reflect-refused: the task metadata was removed"
+  pass "a refused teardown never harvests and never touches the unlanded work it protects"
+}
+
+# Every other path through teardown is unchanged: with no task data dir, the
+# harvest publishes nothing and queues nothing.
+test_teardown_without_a_task_data_dir_is_unchanged() {
+  local case_dir rc=0
+  case_dir=$(make_case reflect-inert)
+  write_meta "$case_dir" local-only ship
+  mkdir -p "$case_dir/data"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  run_teardown_reflect "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "reflect-inert: teardown should succeed"
+  assert_absent "$case_dir/data/task-x1" "reflect-inert: the harvest created a task data dir"
+  assert_no_grep 'reflection capture for task-x1' "$case_dir/stderr" \
+    "reflect-inert: the harvest reported on a path that does not reflect"
+  [ ! -s "$case_dir/state/.wake-queue" ] || assert_no_grep 'reflection:task-x1' \
+    "$case_dir/state/.wake-queue" "reflect-inert: the harvest queued a wake"
+  pass "teardown is unchanged on a path with no task record to reflect on"
+}
+
 test_local_only_fork_remote_allows
+test_teardown_harvests_reflection_before_destroying_the_records
+test_failing_reflection_never_blocks_teardown
+test_hanging_reflection_never_blocks_teardown
+test_refused_teardown_never_harvests_and_never_discards
+test_teardown_without_a_task_data_dir_is_unchanged
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
