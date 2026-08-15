@@ -532,6 +532,60 @@ test_meta_get_and_backend_of_meta() {
   pass "fm_meta_get / fm_backend_of_meta: read key=value, default backend to tmux"
 }
 
+# A missing adapter file must be an ordinary refusal, not a shell death. `.` is a
+# POSIX special builtin: a non-interactive shell that cannot open the named file
+# exits on the spot, with status 0, without running the `|| return 1` on the same
+# line. That turned every caller's refusal into a silent success - most visibly
+# fm-teardown.sh, which reported a clean teardown while never reaching its herdr
+# preflight. These two cases pin the refusal AND the survival of the calling
+# shell, because a test that only checked the return value would pass against a
+# shell that had already died.
+backend_source_probe() {  # <lib-dir> <backend>
+  bash -c '
+    set -eu
+    . "$1/fm-backend.sh"
+    if fm_backend_source "$2"; then echo "SOURCED"; else echo "REFUSED rc=$?"; fi
+    echo "SHELL-ALIVE"
+  ' probe "$1" "$2" 2>&1
+}
+
+# Build a copy of the real bin/ tree with one adapter removed. The whole tree is
+# copied because an adapter sources its own siblings, so a fixture holding only
+# backends/ would fail for the wrong reason and make the control case useless.
+make_lib_without_adapter() {  # <name> <missing-backend>
+  local dir="$TMP_ROOT/$1"
+  mkdir -p "$dir"
+  cp -R "$ROOT/bin" "$dir/bin"
+  rm -f "$dir/bin/backends/$2.sh"
+  printf '%s\n' "$dir/bin"
+}
+
+test_missing_adapter_refuses_without_killing_the_shell() {
+  local dir out
+  dir=$(make_lib_without_adapter missing-herdr-adapter herdr)
+
+  out=$(backend_source_probe "$dir" herdr)
+
+  assert_contains "$out" "REFUSED" "missing adapter: fm_backend_source did not refuse"
+  assert_contains "$out" "SHELL-ALIVE" \
+    "missing adapter: the calling shell died instead of receiving a refusal"
+  assert_not_contains "$out" "SOURCED" "missing adapter: sourcing reported success"
+  pass "a missing backend adapter refuses and leaves the calling shell alive"
+}
+
+test_present_adapter_still_sources() {
+  local dir out
+  # Same fixture shape, with a DIFFERENT adapter removed, so the control proves
+  # the refusal above came from the missing file and not from the fixture itself.
+  dir=$(make_lib_without_adapter missing-orca-adapter orca)
+
+  out=$(backend_source_probe "$dir" herdr)
+
+  assert_contains "$out" "SOURCED" "present adapter: fm_backend_source refused a readable adapter"
+  assert_contains "$out" "SHELL-ALIVE" "present adapter: the calling shell died"
+  pass "a present backend adapter still sources cleanly"
+}
+
 test_resolve_selector_three_forms() {
   local state=$TMP_ROOT/resolve-state fakebin out
   mkdir -p "$state"
@@ -1145,3 +1199,5 @@ test_spawn_refuses_unknown_fm_backend_env
 test_spawn_default_backend_writes_no_meta_field
 test_spawn_explicit_backend_flag_beats_autodetect_herdr_env
 test_spawn_autodetect_nesting_resolves_tmux_silently
+test_missing_adapter_refuses_without_killing_the_shell
+test_present_adapter_still_sources

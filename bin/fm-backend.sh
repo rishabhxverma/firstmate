@@ -592,9 +592,23 @@ fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
 # Each adapter is an independently linted canonical root. The /dev/null source
 # boundaries keep runtime dispatch from importing all five adapter ASTs into
 # every dispatcher consumer while preserving the runtime source operations.
+#
+# The readability guard below is load-bearing, not defensive padding. `.` is a
+# POSIX special builtin, so a non-interactive shell that cannot OPEN the named
+# file treats it as fatal and exits immediately - with status 0, and without
+# running the `|| return 1` written on the very same line. Every caller checks
+# this function's return value, so without the guard a missing adapter turns a
+# refusal into a silent success: the shell dies mid-teardown reporting that
+# everything went fine. Proving the file is readable first keeps a missing
+# adapter an ordinary `return 1` that callers can refuse on, and leaves the
+# per-branch `|| return 1` to cover an adapter that exists but fails while it is
+# being sourced. tests/fm-backend.test.sh pins both halves.
 fm_backend_source() {  # <name>
   local name=$1
   fm_backend_validate "$name" || return 1
+  # Safe to build from $name: fm_backend_validate has already restricted it to
+  # the known backend list, and every adapter is named <backend>.sh.
+  [ -r "$FM_BACKEND_LIB_DIR/backends/$name.sh" ] || return 1
   case "$name" in
     tmux)
       if [ -z "${_FM_BACKEND_TMUX_SOURCED:-}" ]; then
