@@ -30,9 +30,9 @@
 #     status; a failure, a missing tool, or a hang leaves teardown unchanged.
 #   - The wake is queued LAST, only after the atomic publish succeeded, so a
 #     queued wake never points at a missing or half-written file. A capture
-#     killed mid-write leaves the previous complete reflection.md (or none) plus
-#     an orphaned temp file that the next capture overwrites - never a partial
-#     record and never a dangling wake.
+#     killed mid-write leaves the previous complete reflection.md (or none) and
+#     removes its own uniquely named temp file - never a partial record and
+#     never a dangling wake.
 #
 # Precondition: data/<id>/ must already exist. bin/fm-brief.sh creates it for
 # every real task (it holds brief.md), so an absent directory means there is no
@@ -85,10 +85,15 @@ TASK_DATA="$DATA/$ID"
 META="$STATE/$ID.meta"
 STATUS="$STATE/$ID.status"
 OUT="$TASK_DATA/reflection.md"
-TMP="$TASK_DATA/.reflection.md.tmp"
 
 # No task record to annotate: nothing to capture, and nothing to report.
 [ -d "$TASK_DATA" ] || exit 0
+
+# A unique temp file in the publish directory, so the atomic-publish guarantee in
+# this script's header holds for concurrent captures too and not just for a lone
+# writer. Cleared on any exit before the mv, so a failed capture leaves nothing.
+TMP=$(mktemp "$TASK_DATA/.reflection.md.XXXXXX") || exit 1
+trap 'rm -f "$TMP"' EXIT
 
 WT=
 if [ -f "$META" ]; then
@@ -149,11 +154,14 @@ emit_branch_history() {
   printf '```\n'
   git -C "$WT" log --oneline --no-decorate -n "$COMMITS" 2>/dev/null || true
   printf '```\n\n'
-  base=$(git -C "$WT" rev-parse --verify --quiet HEAD 2>/dev/null) || base=
-  if [ -n "$base" ]; then
-    printf 'Change size against the merge base with the default branch:\n\n```\n'
-    git -C "$WT" diff --shortstat "$(default_branch_merge_base "$WT")...HEAD" 2>/dev/null || true
-    printf '```\n\n'
+  if git -C "$WT" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    if base=$(default_branch_merge_base "$WT"); then
+      printf 'Change size against the merge base with the default branch:\n\n```\n'
+      git -C "$WT" diff --shortstat "$base...HEAD" 2>/dev/null || true
+      printf '```\n\n'
+    else
+      printf 'No merge base with the default branch could be resolved at capture time.\n\n'
+    fi
   fi
   printf 'Uncommitted at capture time:\n\n```\n'
   git -C "$WT" status --porcelain 2>/dev/null || true
@@ -162,7 +170,8 @@ emit_branch_history() {
 }
 
 # Best-effort merge base against whichever default-branch ref this worktree can
-# see. An unresolvable base prints nothing and the diff above degrades to empty.
+# see. Returns non-zero when none resolves, so the caller can state that absence
+# instead of printing an empty diff that would read as "no changes".
 default_branch_merge_base() {  # <worktree>
   local wt=$1 ref
   for ref in origin/HEAD origin/main origin/master main master; do
@@ -170,8 +179,7 @@ default_branch_merge_base() {  # <worktree>
       git -C "$wt" merge-base "$ref" HEAD 2>/dev/null && return 0
     fi
   done
-  printf 'HEAD\n'
-  return 0
+  return 1
 }
 
 # shellcheck disable=SC2016 # Backticks are literal Markdown code ticks in the captured report, not expansions.
@@ -197,6 +205,7 @@ default_branch_merge_base() {  # <worktree>
 } > "$TMP"
 
 mv -f "$TMP" "$OUT"
+trap - EXIT
 
 # Queued last, and only after the atomic publish above: a wake never names a
 # file that is missing or half-written.

@@ -211,7 +211,7 @@ test_path_unsafe_task_id_is_refused() {
 }
 
 test_rerun_republishes_and_leaves_no_temp_file() {
-  local case_dir out first
+  local case_dir out first leftover
   case_dir=$(make_case rerun)
 
   run_reflect "$case_dir" || fail "rerun: first capture exited non-zero"
@@ -223,8 +223,8 @@ test_rerun_republishes_and_leaves_no_temp_file() {
 
   assert_grep 'done: second pass' "$out" "rerun: the republished capture is stale"
   [ "$first" != "$(cat "$out")" ] || fail "rerun: the capture was not republished"
-  assert_absent "$case_dir/data/task-r1/.reflection.md.tmp" \
-    "rerun: a temp file was left behind"
+  leftover=$(find "$case_dir/data/task-r1" -maxdepth 1 -name '.reflection.md.*' -print -quit)
+  [ -z "$leftover" ] || fail "rerun: a temp file was left behind ($leftover)"
   pass "a rerun republishes the capture and leaves no temp file"
 }
 

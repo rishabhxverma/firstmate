@@ -2,7 +2,7 @@
 name: task-reflection
 description: >-
   Agent-only procedure for folding a finished task's harvested reflection material into durable knowledge.
-  Load on a `check: reflection` wake, and when a session-start digest surfaces a data/<id>/reflection.md left behind by an earlier teardown.
+  Load on a `check: reflection` wake.
 user-invocable: false
 metadata:
   internal: true
