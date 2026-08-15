@@ -228,6 +228,26 @@ test_rerun_republishes_and_leaves_no_temp_file() {
   pass "a rerun republishes the capture and leaves no temp file"
 }
 
+test_capture_sweeps_a_temp_file_orphaned_by_an_untrappable_kill() {
+  local case_dir stale leftover
+  case_dir=$(make_case sweep)
+  stale="$case_dir/data/task-r1/.reflection.md.abc123"
+
+  printf '# half-written capture\n' > "$stale"
+  touch -t 202001010000 "$stale"
+
+  run_reflect "$case_dir" || fail "sweep: capture exited non-zero"
+
+  assert_absent "$stale" "sweep: an orphaned temp file survived the next capture"
+  [ -f "$case_dir/data/task-r1/reflection.md" ] \
+    || fail "sweep: the capture did not publish reflection.md"
+  [ -f "$case_dir/data/task-r1/brief.md" ] \
+    || fail "sweep: the sweep removed a sibling file it must never touch"
+  leftover=$(find "$case_dir/data/task-r1" -maxdepth 1 -name '.reflection.md.*' -print -quit)
+  [ -z "$leftover" ] || fail "sweep: a temp file was left behind ($leftover)"
+  pass "a capture sweeps a temp file orphaned by an untrappable kill"
+}
+
 test_capture_publishes_the_material_cleanup_destroys
 test_capture_queues_one_wake_naming_the_published_file
 test_capture_never_writes_inside_the_worktree
@@ -236,3 +256,4 @@ test_missing_records_degrade_to_stated_absences
 test_failed_publish_queues_no_wake
 test_path_unsafe_task_id_is_refused
 test_rerun_republishes_and_leaves_no_temp_file
+test_capture_sweeps_a_temp_file_orphaned_by_an_untrappable_kill

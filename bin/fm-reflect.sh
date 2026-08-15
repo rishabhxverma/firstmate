@@ -31,8 +31,11 @@
 #   - The wake is queued LAST, only after the atomic publish succeeded, so a
 #     queued wake never points at a missing or half-written file. A capture
 #     killed mid-write leaves the previous complete reflection.md (or none) and
-#     removes its own uniquely named temp file - never a partial record and
-#     never a dangling wake.
+#     never a partial record or a dangling wake, because only the final `mv`
+#     publishes. Its temp file is removed on exit and on a catchable kill;
+#     teardown escalates to SIGKILL, which cannot be trapped, so a temp file
+#     orphaned that way is swept by the next capture for the same task rather
+#     than accumulating.
 #
 # Precondition: data/<id>/ must already exist. bin/fm-brief.sh creates it for
 # every real task (it holds brief.md), so an absent directory means there is no
@@ -89,11 +92,23 @@ OUT="$TASK_DATA/reflection.md"
 # No task record to annotate: nothing to capture, and nothing to report.
 [ -d "$TASK_DATA" ] || exit 0
 
+# Sweep temp files a previous capture for THIS task could not remove itself,
+# which is the SIGKILL path teardown escalates to. Scoped to this task's own data
+# directory and to this script's own temp-file naming, so reflection.md, brief.md,
+# report.md, and every other task are out of reach. The age floor is far above the
+# bound teardown gives a capture, so a concurrent live capture is never swept.
+find "$TASK_DATA" -maxdepth 1 -type f -name '.reflection.md.??????' -mmin +60 \
+  -exec rm -f {} + 2>/dev/null || true
+
 # A unique temp file in the publish directory, so the atomic-publish guarantee in
 # this script's header holds for concurrent captures too and not just for a lone
 # writer. Cleared on any exit before the mv, so a failed capture leaves nothing.
 TMP=$(mktemp "$TASK_DATA/.reflection.md.XXXXXX") || exit 1
 trap 'rm -f "$TMP"' EXIT
+for sig in INT TERM HUP; do
+  # shellcheck disable=SC2064 # $sig must expand now: the handler needs its own signal number.
+  trap "rm -f \"\$TMP\"; trap - $sig EXIT; kill -s $sig \$\$" "$sig"
+done
 
 WT=
 if [ -f "$META" ]; then
