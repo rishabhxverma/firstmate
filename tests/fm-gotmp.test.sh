@@ -60,6 +60,11 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  # fm-timeout-lib.sh + fm-reflect.sh: teardown sources the bounded runner and
+  # runs the reflection harvest through it before any destructive step. This
+  # fixture has no data/<id>/, so the harvest is a real no-op rather than a stub.
+  ln -s "$ROOT/bin/fm-timeout-lib.sh" "$fake/bin/fm-timeout-lib.sh"
+  ln -s "$ROOT/bin/fm-reflect.sh" "$fake/bin/fm-reflect.sh"
   # fm-lock-lib.sh: teardown sources it for the shared lock-staleness proof.
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # Lifecycle serialization and shared adapter ownership are sourced by teardown.
@@ -142,6 +147,11 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  # fm-timeout-lib.sh + fm-reflect.sh: teardown sources the bounded runner and
+  # runs the reflection harvest through it before any destructive step. This
+  # fixture has no data/<id>/, so the harvest is a real no-op rather than a stub.
+  ln -s "$ROOT/bin/fm-timeout-lib.sh" "$fake/bin/fm-timeout-lib.sh"
+  ln -s "$ROOT/bin/fm-reflect.sh" "$fake/bin/fm-reflect.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
   ln -s "$ROOT/bin/fm-wake-lib.sh" "$fake/bin/fm-wake-lib.sh"

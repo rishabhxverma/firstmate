@@ -142,7 +142,7 @@ herdr_cli_available() {
 herdr_adapter_load() {
   [ -z "${FM_REMOTE_DOCTOR_HERDR_LOADED:-}" ] || return 0
   herdr_cli_available || return 1
-  [ -f "$SCRIPT_DIR/fm-backend.sh" ] && [ -f "$SCRIPT_DIR/backends/herdr.sh" ] || return 1
+  [ -r "$SCRIPT_DIR/fm-backend.sh" ] && [ -r "$SCRIPT_DIR/backends/herdr.sh" ] || return 1
   # shellcheck source=bin/fm-backend.sh
   . "$SCRIPT_DIR/fm-backend.sh" || return 1
   fm_backend_source herdr || return 1

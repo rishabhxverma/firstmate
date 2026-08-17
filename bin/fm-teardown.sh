@@ -93,6 +93,21 @@
 # refusal above has already passed, and BEFORE any worktree return, branch
 # delete, or backend kill below - a still-active run or a leaked process may
 # own live work in that worktree):
+#   Fix 0 - harvest the task's reflection material through bin/fm-reflect.sh,
+#     which owns what is captured, where it lands, and why the capture cannot
+#     endanger unlanded work. Reflection used to depend on someone remembering
+#     to run it, and it was most likely to be skipped exactly when it mattered
+#     most, because this teardown is what destroys the event log, the metadata,
+#     and the isolated copy that reflection reads. Running it here makes the
+#     harvest automatic and puts it after every safety refusal, so a refused
+#     teardown captures nothing and a --force teardown still reflects.
+#     Bounded by FM_REFLECT_TIMEOUT_SECS (default 20s) through
+#     bin/fm-timeout-lib.sh's whole-process-group runner, and best effort in
+#     both directions: teardown ignores the capture's exit status, so a failing
+#     or hanging capture only prints a note. FM_REFLECT_CMD overrides the
+#     capture command, and setting it empty opts out of the harvest entirely.
+#     Skipped for kind=secondmate, which is a persistent home rather than a work
+#     item with a task worktree to reflect on.
 #   Fix 1 - conclude the task's own no-mistakes run. A ship task's worktree can
 #     be torn down while its no-mistakes pipeline run is still PARKED at a gate
 #     (awaiting_approval/fix_review/any awaiting_agent field), with no worker
@@ -166,6 +181,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -1196,6 +1213,28 @@ validate_worktree_teardown_safety() {
       return 1
     fi
   fi
+}
+
+# Fix 0 (see script header): harvest this task's reflection material before the
+# destructive sequence below erases it. bin/fm-reflect.sh owns what is captured,
+# where it lands, and why the capture cannot endanger unlanded work. Everything
+# this wrapper adds is the bound and the best-effort contract: the capture runs
+# with a hard deadline through the shared bounded runner, and neither a failure
+# nor a hang changes anything teardown does next.
+REFLECT_TIMEOUT=${FM_REFLECT_TIMEOUT_SECS:-20}
+case "$REFLECT_TIMEOUT" in ''|0|*[!0-9]*) REFLECT_TIMEOUT=20 ;; esac
+capture_task_reflection() {
+  local cmd rc=0
+  cmd=${FM_REFLECT_CMD-$SCRIPT_DIR/fm-reflect.sh}
+  # An empty command is the documented opt-out: capture nothing, report nothing.
+  [ -n "$cmd" ] || return 0
+  fm_run_timed "$REFLECT_TIMEOUT" "$cmd" "$ID" >&2 || rc=$?
+  case "$rc" in
+    0) ;;
+    124) echo "note: reflection capture for $ID hit its ${REFLECT_TIMEOUT}s bound; continuing teardown" >&2 ;;
+    *) echo "note: reflection capture for $ID failed (exit $rc); continuing teardown" >&2 ;;
+  esac
+  return 0
 }
 
 # Fix 1 (see script header): does the active-or-most-recent no-mistakes run in
@@ -2372,13 +2411,15 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
 fi
 
 # Every landed/discard-work refusal above has now passed (or --force skipped
-# them). Fix 1 and Fix 2 (see script header) run here, unconditionally on
-# --force, and before ANY destructive step below - a still-parked run or a
-# leaked process can own live work in this exact worktree. Not for
+# them). Fix 0, Fix 1, and Fix 2 (see script header) run here, unconditionally
+# on --force, and before ANY destructive step below - the records reflection
+# reads are about to be erased, and a still-parked run or a leaked process can
+# own live work in this exact worktree. Not for
 # kind=secondmate: a secondmate home's own runtime lifecycle is owned by the
 # dedicated process-event and firstmate-home removal machinery further below,
 # not by task-worktree cleanup.
 if [ "$KIND" != secondmate ]; then
+  capture_task_reflection
   conclude_task_no_mistakes_run "$WT"
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
 fi
