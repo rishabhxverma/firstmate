@@ -102,6 +102,46 @@ test_limit_banners_classify_with_a_parsed_reset_time() {
   pass "usage-limit banners classify as a limit stall with the reset time resolved"
 }
 
+# Observed live on 2026-08-24, from the pipeline's own review worker. Kept as a
+# named case because it is the only banner in this suite read off a real Claude
+# worker rather than sourced from the vetted prior art, and because it is the
+# exact shape that exposed the already-passed-reset trap below.
+test_the_observed_session_limit_banner_parses() {
+  local observed out
+  observed="You've hit your session limit · resets 4:40pm (America/Mexico_City)"
+  out=$(classify "$observed")
+  [ "${out%% *}" = limit ] || fail "the observed session-limit banner did not classify: $out"
+  [ "$(TZ=America/Mexico_City at_local "${out#* }")" = "2026-08-24 16:40" ] \
+    || fail "the observed session-limit banner resolved to the wrong time: $out"
+  pass "the session-limit banner observed in the wild parses to its own reset time"
+}
+
+# The trap that banner exposed: a reset time names a time of day, not a date, so
+# one that has already passed today gets rolled to tomorrow. Read three minutes
+# after its own reset - which is exactly how it was observed - that turns a
+# window that just REOPENED into a 24-hour wait, parking a healthy worker for a
+# day. Time-of-day cannot resolve the ambiguity, so the wait is bounded instead:
+# past the bound the ladder takes over and the worker is retried within minutes.
+test_a_reset_that_already_passed_does_not_park_the_worker_for_a_day() {
+  local d id n reset
+  d="$TMP_ROOT/reset-just-passed/state"; mkdir -p "$d"; id=task
+  n=$(now_at '2026-08-24 16:43:00')
+  reset=$(fm_stall_parse_reset "You've hit your session limit · resets 4:43pm" "$n")
+  [ -n "$reset" ] || fail "a just-passed reset time did not parse at all"
+  [ "$((reset - n))" -gt 86000 ] \
+    || fail "fixture no longer exercises the rollover it is pinning"
+  # It must NOT be trusted as a wait: that is the whole point.
+  [ -z "$(fm_stall_reset_epoch limit "$reset" "$n")" ] \
+    || fail "a reset rolled a full day forward was trusted as a wait"
+  [ "$(fm_stall_plan "$d" "$id" limit "$reset" "$n")" = "armed 120" ] \
+    || fail "a just-passed reset parked the worker instead of falling back to the ladder"
+  # A genuine overnight wait inside the bound is still honoured.
+  rm -f "$(fm_stall_record_path "$d" "$id")"
+  [ "$(fm_stall_plan "$d" "$id" limit "$((n + 18000))" "$n")" = "armed $((18000 + FM_STALL_RESET_SETTLE))" ] \
+    || fail "a plausible five-hour reset wait was not honoured"
+  pass "a reset time that already passed falls back to the ladder instead of waiting a day"
+}
+
 test_a_limit_banner_outranks_an_overload_banner() {
   local out
   out=$(classify 'API Error: 529 overloaded_error
@@ -259,8 +299,8 @@ test_a_limit_episode_schedules_its_first_attempt_for_the_reset() {
   [ "$(fm_stall_plan "$d" "$id" limit "$((n - 10))" "$n")" = "armed 120" ] \
     || fail "a past reset time was trusted over the ladder"
   rm -f "$(fm_stall_record_path "$d" "$id")"
-  [ "$(fm_stall_plan "$d" "$id" limit "$((n + 999999))" "$n")" = "armed 120" ] \
-    || fail "an implausibly distant reset time was trusted over the ladder"
+  [ "$(fm_stall_plan "$d" "$id" limit "$((n + FM_STALL_MAX_RESET_WAIT + 60))" "$n")" = "armed 120" ] \
+    || fail "a reset time past FM_STALL_MAX_RESET_WAIT was trusted over the ladder"
   pass "a limit episode waits for its parsed reset, and falls back to the ladder when there is none"
 }
 
@@ -601,6 +641,8 @@ test_switching_auto_resume_off_leaves_the_pane_alone() {
 
 test_overload_banners_classify_with_their_status_code
 test_limit_banners_classify_with_a_parsed_reset_time
+test_the_observed_session_limit_banner_parses
+test_a_reset_that_already_passed_does_not_park_the_worker_for_a_day
 test_a_limit_banner_outranks_an_overload_banner
 test_an_untimed_limit_still_classifies_but_carries_no_reset
 test_displayed_content_without_error_framing_is_not_a_stall

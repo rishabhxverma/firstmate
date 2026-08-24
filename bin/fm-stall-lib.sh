@@ -80,6 +80,20 @@ FM_STALL_EPISODE_RESET="${FM_STALL_EPISODE_RESET:-1800}"
 # reopened.
 FM_STALL_RESET_SETTLE="${FM_STALL_RESET_SETTLE:-60}"
 
+# Longest wait a parsed reset time is allowed to schedule. A banner names a
+# time of day, not a date, so a time that has already passed today is
+# genuinely ambiguous: "resets 3am" read at 10pm means five hours from now,
+# but read three minutes after 3am it means the window ALREADY reopened and
+# rolling it to tomorrow would park a healthy worker for a full day.
+# Observed live on 2026-08-24: a worker showed
+# "You've hit your session limit · resets 4:40pm" and was read at 4:43pm, i.e.
+# three minutes after its own reset. Time-of-day alone cannot separate those
+# two cases, so this bounds the damage instead of guessing: a wait longer than
+# one plausible session window is not trusted, and the episode falls back to
+# the ladder. Being early costs one spent attempt on a bounded ladder; being a
+# day late costs the whole point of unattended recovery.
+FM_STALL_MAX_RESET_WAIT="${FM_STALL_MAX_RESET_WAIT:-21600}"
+
 # --- configuration gate ----------------------------------------------------
 
 # fm_stall_auto_resume_setting <config-dir> -> on|off
@@ -89,7 +103,7 @@ fm_stall_auto_resume_setting() {  # <config-dir>
   local dir=${1:-} value
   [ -n "$dir" ] || { printf 'on'; return 0; }
   [ -f "$dir/auto-resume" ] || { printf 'on'; return 0; }
-  value=$(head -n 1 "$dir/auto-resume" 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+  value=$(head -n 1 "$dir/auto-resume" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   case "$value" in
     off|0|false|no|disabled) printf 'off' ;;
     *)                       printf 'on' ;;
@@ -195,7 +209,7 @@ fm_stall_parse_reset() {  # <text> <now-epoch>
   after=$(printf '%s' "$line" | sed -E 's/.*[Rr][Ee][Ss][Ee][Tt][A-Za-z]*[[:space:]]+(at[[:space:]]+)?//')
   tok=$(printf '%s' "$after" | grep -oiE '^[0-9]{1,2}(:[0-9]{2})?[[:space:]]*([ap]\.?m\.?)?' | head -n 1)
   [ -n "$tok" ] || return 0
-  meridiem=$(printf '%s' "$tok" | grep -oiE '[ap]\.?m\.?' | tr -d '. ' | tr 'A-Z' 'a-z')
+  meridiem=$(printf '%s' "$tok" | grep -oiE '[ap]\.?m\.?' | tr -d '. ' | tr '[:upper:]' '[:lower:]')
   hh=$(printf '%s' "$tok" | grep -oE '^[0-9]{1,2}')
   mm=$(printf '%s' "$tok" | grep -oE ':[0-9]{2}' | tr -d ':')
   [ -n "$mm" ] || mm=00
@@ -251,7 +265,7 @@ fm_stall_field() {  # <state-dir> <id> <key>
   file=$(fm_stall_record_path "$1" "$2")
   [ -f "$file" ] || return 0
   line=$(head -n 1 "$file" 2>/dev/null || true)
-  case "$line" in v1\ *) ;; *) return 0 ;; esac
+  case "$line" in "$FM_STALL_LIB_VERSION "*) ;; *) return 0 ;; esac
   for token in $line; do
     case "$token" in
       "$key"=*) printf '%s' "${token#*=}"; return 0 ;;
@@ -270,8 +284,8 @@ fm_stall_write() {  # <state-dir> <id> <class> <attempts> <next> <first> <last> 
   local dir=$1 id=$2 file tmp
   file=$(fm_stall_record_path "$dir" "$id")
   tmp="$file.tmp.$$"
-  printf 'v1 class=%s attempts=%s next=%s first=%s last=%s escalated=%s quiet=%s\n' \
-    "$3" "$4" "$5" "$6" "$7" "$8" "$9" > "$tmp" 2>/dev/null || return 1
+  printf '%s class=%s attempts=%s next=%s first=%s last=%s escalated=%s quiet=%s\n' \
+    "$FM_STALL_LIB_VERSION" "$3" "$4" "$5" "$6" "$7" "$8" "$9" > "$tmp" 2>/dev/null || return 1
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   return 0
 }
@@ -360,14 +374,15 @@ fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now>
 
 # fm_stall_reset_epoch <class> <detail> <now> -> a usable future reset epoch, or
 # empty. Only a limit episode carries one, and only when it is genuinely ahead
-# of now and inside one day - a further-out value means the parse went wrong,
-# and waiting on it would be worse than the ladder.
+# of now and no further out than FM_STALL_MAX_RESET_WAIT; anything beyond that
+# is either a misparse or a time-of-day that has already passed and was rolled
+# to tomorrow, and the bounded ladder is the safer schedule for both.
 fm_stall_reset_epoch() {  # <class> <detail> <now>
   local class=$1 detail=$2 now=$3
   [ "$class" = limit ] || return 0
   case "$detail" in ''|*[!0-9]*) return 0 ;; esac
   [ "$detail" -gt "$now" ] || return 0
-  [ "$((detail - now))" -le 86400 ] || return 0
+  [ "$((detail - now))" -le "$FM_STALL_MAX_RESET_WAIT" ] || return 0
   printf '%s' "$detail"
 }
 
@@ -400,5 +415,7 @@ fm_stall_resume_text() {  # <class>
     limit) cause='your usage limit window has reset' ;;
     *)     cause='the upstream API error was transient and has cleared' ;;
   esac
+  # shellcheck disable=SC2016 # single quotes are deliberate: the backtick-wrapped
+  # command must reach the worker verbatim, not expand here.
   printf 'Auto-resume: %s, so pick your task back up. First re-read your own current state - if a no-mistakes run is active, read `no-mistakes axi status` and continue from the gate it reports rather than redoing pipeline work that already applied - then carry on.' "$cause"
 }

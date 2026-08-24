@@ -131,6 +131,8 @@ A pane mid-turn, a pane holding a genuine question or permission dialog, and a p
 A backend with no composer classifier therefore never auto-resumes.
 
 A usage-limit stall waits for the reset time its own banner names, plus `FM_STALL_RESET_SETTLE`.
+That wait is bounded by `FM_STALL_MAX_RESET_WAIT`, because a banner names a time of day and not a date: one that has already passed today rolls to tomorrow, and read shortly after its own reset that would park a worker whose window has just reopened for a full day.
+Past the bound the ladder takes over, so being early costs one attempt while being a day late would cost the whole point of unattended recovery.
 A transient-error stall, and a limit banner carrying no readable reset time, follow the bounded ladder in `FM_STALL_BACKOFF`.
 Repeated stalls continue one episode rather than restarting that ladder, so a worker that resumes and immediately re-stalls backs off instead of retrying on every poll.
 After `FM_STALL_MAX_ATTEMPTS` deliveries the episode escalates once through the ordinary stale wake, carrying its spent-attempt count so the supervisor inspects instead of resuming again, and stops proposing resumes.
@@ -557,6 +559,7 @@ FM_STALL_BACKOFF='120 300 900 1800'  # seconds between Claude auto-resume attemp
 FM_STALL_MAX_ATTEMPTS=4   # auto-resume deliveries allowed against one stall episode before it escalates to a human
 FM_STALL_EPISODE_RESET=1800   # seconds a worker must stay clear of any stall banner before its episode is discarded and the ladder restarts
 FM_STALL_RESET_SETTLE=60   # grace added after a parsed usage-limit reset time before the first resume
+FM_STALL_MAX_RESET_WAIT=21600   # longest wait a parsed reset time may schedule; a banner names a time of day, not a date, so one already past today rolls to tomorrow and must not park a worker for a day - past this bound the ladder takes over
 FM_STALL_SCAN_LINES=20   # non-blank rendered rows above the composer scanned for a stall banner
 FM_STALL_SEND_BIN=      # auto-resume steer transport; defaults to bin/fm-send.sh, overridden only by tests
 FM_STALL_SEND_TIMEOUT=45   # hard bound on one auto-resume delivery
