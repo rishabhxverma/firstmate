@@ -295,7 +295,8 @@ fm_stall_epoch_at() {  # <tz> <YYYY-MM-DD> <HH> <MM>
 #
 # Handles the machine form "Claude AI usage limit reached|<epoch>" and the
 # rendered forms "resets 3am", "resets 3:30am", "resets at 15:00",
-# "will reset at 3pm", each with an optional trailing "(Area/City)" zone. An
+# "will reset at 3pm", each with an optional trailing "(Area/City)" zone,
+# including multi-segment and hyphenated zone names. An
 # already-past time of day rolls to the next day, because the banner names the
 # next reset, not a historical one. Anything else - a spend cap with no timed
 # reset, a date-bearing weekly reset, a phrasing not seen yet - returns empty on
@@ -330,7 +331,7 @@ fm_stall_parse_reset() {  # <text> <now-epoch>
     *)  hour24=$hh ;;
   esac
   [ "$hour24" -le 23 ] || return 0
-  tz=$(printf '%s' "$after" | grep -oE '\(([A-Za-z_]+/[A-Za-z_]+|UTC|GMT)\)' | head -n 1 | tr -d '()')
+  tz=$(printf '%s' "$after" | grep -oE '\(([A-Za-z_-]+(/[A-Za-z_-]+)+|UTC|GMT)\)' | head -n 1 | tr -d '()')
   hour24=$(printf '%02d' "$hour24")
   day=$(fm_stall_day_for "$tz" "$now")
   [ -n "$day" ] || return 0
@@ -502,10 +503,6 @@ fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now> [pane-digest]
   escalated=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" escalated)" 0)
   sent=$(fm_stall_field "$dir" "$id" sent)
   sent=${sent:-0}
-  if [ "$escalated" -ne 0 ]; then
-    printf 'escalated %s\n' "$attempts"
-    return 0
-  fi
   # limit and overload are two renderings of one ongoing stall. Adopting the
   # new class must KEEP the ladder position: resetting attempts to zero here let
   # a pane flapping between renderings restart the ladder forever without ever
@@ -518,9 +515,17 @@ fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now> [pane-digest]
       next=$((reset + FM_STALL_RESET_SETTLE))
     fi
   fi
-  # The stall is showing again, so this episode is not quiet any more.
+  # The stall is showing again, so this episode is not quiet any more - and an
+  # adopted class must be persisted even mid-episode. This runs before the
+  # escalated check on purpose: an escalated episode whose stall is still
+  # showing must never age into a "fresh" one through a stale quiet stamp and
+  # re-arm a second ladder plus a second wake.
   if [ "$quiet" -ne 0 ] || [ "$prev_class" != "$class" ]; then
-    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 0 0 "$sent" || return 1
+    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" "$escalated" 0 "$sent" || return 1
+  fi
+  if [ "$escalated" -ne 0 ]; then
+    printf 'escalated %s\n' "$attempts"
+    return 0
   fi
   if [ "$now" -lt "$next" ]; then
     printf 'wait %s\n' "$((next - now))"

@@ -475,6 +475,30 @@ surface_nonterminal_stale() {  # <window> <hash> [reason]
 # switched off, no banner, an unreadable composer, an episode that has already
 # escalated, or one whose due attempt found an unchanged pane - and the ordinary
 # stale path then runs unchanged.
+# The composer-gate decline is logged on TRANSITION only, for the same reason
+# the `wait` verdict is silent: a limit window can run for hours, and a line per
+# poll would push every other diagnostic out of the size-capped triage log. The
+# last logged (class, composer) tuple is kept at $STATE/.stall-declined-<key>
+# and the line repeats only when that tuple changes; the marker is dropped the
+# moment the pane stops being a declined stall (busy, no banner, or an empty
+# composer), so the next decline is a fresh transition and logs again.
+stall_declined_marker() {  # <window>
+  printf '%s/.stall-declined-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"
+}
+
+stall_note_declined() {  # <window> <task> <class> <composer>
+  local w=$1 task=$2 class=$3 composer=$4 marker tuple
+  marker=$(stall_declined_marker "$w")
+  tuple="$class $composer"
+  [ "$(cat "$marker" 2>/dev/null || true)" != "$tuple" ] || return 0
+  triage_log "auto-resume declined for $task ($class stall, composer $composer): $w"
+  printf '%s\n' "$tuple" > "$marker" 2>/dev/null || true
+}
+
+stall_clear_declined() {  # <window>
+  rm -f "$(stall_declined_marker "$1")" 2>/dev/null || true
+}
+
 stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably working>
   local w=$1 task=$2 tail=$3 busy=$4 meta harness classification class detail
   local now verdict arg composer text rc digest
@@ -492,6 +516,7 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
     # its polls BUSY: without this, an episode would never close and a stall
     # hours later would inherit a ladder already half spent.
     fm_stall_note_clear "$STATE" "$task" "$now"
+    stall_clear_declined "$w"
     return 1
   fi
   classification=$(fm_stall_classify "$tail" "$now")
@@ -499,17 +524,20 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
   detail=${classification#* }
   if [ "$class" = none ]; then
     fm_stall_note_clear "$STATE" "$task" "$now"
+    stall_clear_declined "$w"
     return 1
   fi
   composer=$(fm_backend_composer_state "$(window_backend "$w")" "$w" 2>/dev/null || true)
   if [ "$composer" != empty ]; then
     # A banner hugging the composer but a composer that is not provably empty:
     # decline, but record that the stall is still showing so the episode cannot
-    # quietly age out and later read as freshly recovered.
-    triage_log "auto-resume declined for $task ($class stall, composer ${composer:-unreadable}): $w"
+    # quietly age out and later read as freshly recovered. The decline itself is
+    # logged on transition only by stall_note_declined above.
     fm_stall_note_showing "$STATE" "$task" "$now"
+    stall_note_declined "$w" "$task" "$class" "${composer:-unreadable}"
     return 1
   fi
+  stall_clear_declined "$w"
   verdict=$(fm_stall_plan "$STATE" "$task" "$class" "$detail" "$now" "$digest") || return 1
   arg=${verdict#* }
   case "${verdict%% *}" in

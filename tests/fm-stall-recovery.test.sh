@@ -83,6 +83,14 @@ test_limit_banners_classify_with_a_parsed_reset_time() {
   [ "$(TZ=America/Toronto at_local "${out#* }")" = "2026-08-24 15:00" ] \
     || fail "a zoned reset time was not resolved in its own timezone: $out"
 
+  out=$(classify "You've hit your usage limit · resets 3pm (America/Argentina/Buenos_Aires)")
+  [ "$(TZ=America/Argentina/Buenos_Aires at_local "${out#* }")" = "2026-08-24 15:00" ] \
+    || fail "a three-segment zone was not resolved in its own timezone: $out"
+
+  out=$(classify "You've hit your usage limit · resets 3pm (America/Port-au-Prince)")
+  [ "$(TZ=America/Port-au-Prince at_local "${out#* }")" = "2026-08-24 15:00" ] \
+    || fail "a hyphenated zone was not resolved in its own timezone: $out"
+
   out=$(classify '5-hour limit reached ∙ resets 3am')
   [ "$(at_local "${out#* }")" = "2026-08-25 03:00" ] \
     || fail "an unzoned reset already past today did not roll to the next day: $out"
@@ -326,6 +334,32 @@ test_an_episode_walks_the_ladder_then_escalates_once() {
   [ "$(fm_stall_plan "$d" "$id" overload 529 "$((now + 100000))")" = "escalated 4" ] \
     || fail "an escalated episode proposed more work"
   pass "an episode walks the bounded ladder, escalates once, then stays quiet"
+}
+
+test_an_escalated_episode_whose_stall_returns_never_rearms() {
+  local d id now
+  d=$(mktemp -d "$TMP_ROOT/escalated-rearm.XXXXXX"); id=stuck
+  now=$REF_NOW
+  printf 'v2 class=overload attempts=4 next=%s first=%s last=%s escalated=1 quiet=0 sent=0\n' \
+    "$now" "$now" "$now" > "$d/$id.stall"
+  # A human nudges the worker; one busy poll stamps the episode quiet.
+  fm_stall_note_clear "$d" "$id" "$((now + 60))"
+  [ "$(fm_stall_field "$d" "$id" quiet)" = "$((now + 60))" ] \
+    || fail "a busy poll did not stamp the escalated episode quiet"
+  # The same stall is showing again well inside the quiet window.
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$((now + 120))")" = "escalated 4" ] \
+    || fail "an escalated episode proposed work when its stall returned"
+  [ "$(fm_stall_field "$d" "$id" quiet)" = 0 ] \
+    || fail "seeing the stall again did not un-quiet the escalated episode"
+  [ "$(fm_stall_field "$d" "$id" escalated)" = 1 ] \
+    || fail "seeing the stall again dropped the escalated mark"
+  # Far past FM_STALL_EPISODE_RESET, with the stall still showing every poll,
+  # the episode must not age into a fresh one and re-arm a second ladder.
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$((now + 120 + FM_STALL_EPISODE_RESET * 2))")" = "escalated 4" ] \
+    || fail "a still-stalled escalated episode re-armed after the quiet window"
+  [ ! -s "$d/$id.stall" ] || grep -q 'escalated=1' "$d/$id.stall" \
+    || fail "the escalated record was replaced: $(cat "$d/$id.stall")"
+  pass "an escalated episode whose stall keeps showing stays escalated past the quiet window"
 }
 
 test_an_episode_survives_a_brief_clear_and_restarts_after_a_long_one() {
@@ -788,8 +822,34 @@ test_a_pane_with_text_already_in_its_composer_is_never_resumed() {
   [ ! -e "$state/pending.stall" ] || { reap "$pid"; fail "a pane with text already typed opened an episode"; }
   wait_for_grep 'auto-resume declined for pending' "$state/.watch-triage.log" 300 \
     || fail "the composer gate did not record why it declined: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  # The decline is a transition, not a per-poll event. The stale path ends this
+  # watcher, and the daemon relaunches it over the same state for as long as the
+  # pane stays declined, so the suppression has to hold across relaunches: a
+  # limit window that runs for hours would otherwise flood the size-capped
+  # triage log one line per poll.
+  wait "$pid" 2>/dev/null || true
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  pid=$!
+  sleep 3
+  [ "$(grep -c 'auto-resume declined for pending' "$state/.watch-triage.log")" = 1 ] \
+    || { reap "$pid"; fail "the same composer decline was logged again on a later poll: $(cat "$state/.watch-triage.log")"; }
   reap "$pid"
-  pass "a pane with text already in its composer is never auto-resumed"
+  # A different stall class behind the same held composer is a new transition
+  # and is logged exactly once more. The held composer keeps its boxed shape:
+  # in the bare shape its typed text is the last substantive row, and the
+  # adjacency walk correctly refuses to reach a banner floating above it.
+  cy=$(write_pane "$pane" boxed "please rerun the failing case" \
+    "You've hit your usage limit · resets 11pm")
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  pid=$!
+  wait_for_grep 'auto-resume declined for pending (limit stall' "$state/.watch-triage.log" \
+    || { reap "$pid"; fail "a changed stall class was not logged as a new decline: $(cat "$state/.watch-triage.log")"; }
+  sleep 3
+  [ "$(grep -c 'auto-resume declined for pending' "$state/.watch-triage.log")" = 2 ] \
+    || { reap "$pid"; fail "the decline log did not settle at one line per transition: $(cat "$state/.watch-triage.log")"; }
+  [ ! -s "$dir/sent.log" ] || { reap "$pid"; fail "a pane with text already typed was auto-resumed: $(cat "$dir/sent.log")"; }
+  reap "$pid"
+  pass "a pane with text already in its composer is never auto-resumed, and the decline is logged once per transition"
 }
 
 test_a_recovered_workers_stale_banner_is_never_retriggered() {
@@ -877,6 +937,7 @@ test_leading_zero_reset_times_parse_in_base_ten
 test_backoff_ladder_is_bounded_and_repeats_its_last_rung
 test_auto_resume_is_default_on_for_claude_only
 test_an_episode_walks_the_ladder_then_escalates_once
+test_an_escalated_episode_whose_stall_returns_never_rearms
 test_an_episode_survives_a_brief_clear_and_restarts_after_a_long_one
 test_a_still_showing_stall_is_never_marked_clear
 test_a_limit_episode_schedules_its_first_attempt_for_the_reset
