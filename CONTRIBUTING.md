@@ -7,25 +7,30 @@ One rule up front:
 We require this to reduce the maintainer's burden of reviewing and merging contributions.
 
 `no-mistakes` puts a local git proxy in front of your real remote.
-Pushing through it runs an AI-driven review/test/lint pipeline in an isolated worktree, forwards the push upstream only after every check passes, and opens a clean PR automatically.
+Pushing through it runs an AI-driven review/test/lint pipeline in an isolated worktree, forwards the push to your configured remote only after every check passes, and opens a clean PR automatically.
 
 This is a repo convention rather than an automated admission check: no CI job inspects a PR body for a no-mistakes signature.
 
 ## Workflow
 
-1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent (`git@github.com:kunchenguid/firstmate.git`).
-2. Create a branch and make your changes.
-3. Initialize the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/firstmate.git` (firstmate expects **no-mistakes v1.31.2+**; without a fork, plain `no-mistakes init` still works for maintainers with push access).
-4. Commit your changes.
-5. Push through the gate instead of pushing to `origin`:
+All delivery lands in this fork, `rishabhxverma/firstmate`: your local `origin` points at it, and pull requests open against its `main`.
+Upstream `kunchenguid/firstmate` is a merge source only, never a publish target.
+Local customizations stay permanently local and are never sent upstream; close rather than pursue any suggestion to contribute them back.
+The parent repo's first-time-contributor admission and check-run approval requirements do not apply here, because merges are decided by this fork's own configured merge authority.
+
+1. Create a branch from `main` and make your changes.
+2. Commit your changes.
+3. If the gate is not initialized yet, run `no-mistakes init` once (firstmate expects **no-mistakes v1.31.2+**).
+4. Push through the gate instead of pushing to `origin` directly:
 
    ```sh
    git push no-mistakes
    ```
 
-6. Run `no-mistakes` to attach to the pipeline, watch findings, authorize auto-fixes, and review ask-user findings as needed.
+5. Run `no-mistakes` to attach to the pipeline, watch findings, authorize auto-fixes, and review ask-user findings as needed.
    Follow the installed no-mistakes version's SKILL.md and live `axi` help for gate mechanics.
-7. Once the pipeline passes, it pushes the branch to your fork and opens the PR against the parent repo for you.
+6. Once the pipeline passes, it pushes the branch to `origin` and opens the PR against this fork's `main` for you.
+7. Landing follows this fork's configured merge authority; never merge a PR without it.
 
 See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
 
