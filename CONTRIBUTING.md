@@ -105,4 +105,4 @@ The [Herdr backend guide](docs/herdr-backend.md#destructive-lab-safety) owns the
 
 ## Questions
 
-Open an issue, or talk to me on [Discord](https://discord.gg/Wsy2NpnZDu).
+Open an issue on [rishabhxverma/firstmate](https://github.com/rishabhxverma/firstmate/issues).
