@@ -6,11 +6,6 @@
       alt="Platform"
       src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue?style=flat-square"
   /></a>
-  <a href="https://x.com/kunchenguid"
-    ><img
-      alt="X"
-      src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square"
-  /></a>
 </p>
 
 <h3 align="center">Talk to one agent. Ship with a crew.</h3>
