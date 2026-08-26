@@ -11,11 +11,6 @@
       alt="X"
       src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square"
   /></a>
-  <a href="https://discord.gg/Wsy2NpnZDu"
-    ><img
-      alt="Discord"
-      src="https://img.shields.io/discord/1439901831038763092?style=flat-square&label=discord"
-  /></a>
 </p>
 
 <h3 align="center">Talk to one agent. Ship with a crew.</h3>
