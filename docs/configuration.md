@@ -242,6 +242,14 @@ The Kimi installer requires an existing regular non-symlink `~/.kimi-code/config
 Its `remove` action excises only the marker-delimited Firstmate region and removes Firstmate's hook files.
 For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected executable with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
+## Runtime switch (bin/fm-switch-runtime.sh)
+
+`bin/fm-switch-runtime.sh <opencode|claude>` flips the local fleet runtime between the opencode+oxalpha pairing and Claude in one command, replacing a three-file hand edit.
+It rewrites `config/crew-harness` and flips the top-level `agent:` key in `~/.no-mistakes/config.yaml`, preserving every surrounding comment, and is idempotent in both directions.
+When targeting opencode it first verifies `~/.config/opencode/opencode.json` pins `"model": "opencode/x-preview-f-free"`, because `opencode serve` rejects `-m` and that pin is the only way workers select oxalpha; a missing pin triggers an offer to add it and declining aborts before anything is written.
+Running no-mistakes runs keep their launch-time agent until they finish, and the primary session itself must be relaunched under the other CLI by hand; the script prints both limits on every run.
+`bin/fm-switch-runtime.sh --status` prints the effective runtime per surface: crew harness, pipeline agent, and opencode model pin.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
