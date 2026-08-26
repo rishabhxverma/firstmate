@@ -130,6 +130,12 @@ Only then does the rendered tail decide which stall it is.
 A pane mid-turn, a pane holding a genuine question or permission dialog, and a pane with text somebody already typed each fail one of those two structural gates and are never resumed, whatever their text says.
 A backend with no composer classifier therefore never auto-resumes.
 
+Rendered text is also positional: a banner counts only when it sits immediately above the composer, with nothing but blank rows, box-drawing rows, and the composer's own rendering between them.
+Claude keeps old banners in its transcript after a successful resume, so a banner floating above later output is history, and classifying it would re-nudge a recovered worker whose turn had already finished.
+One wrapped row is allowed, because upstream error banners embed a JSON blob wide enough to wrap; the upper row must end mid-payload for that, so a finished line of output above a stale banner never reads as a wrapped banner.
+A due resume against a pane byte-identical to the last delivery is refused too: typing into a pane nothing has changed since the previous steer adds no information, and such an episode releases the window to the ordinary stale path, which is the escalation a never-moved pane deserves.
+A change between the limit and overload renderings keeps the episode's ladder position rather than restarting it, so a pane flapping between renderings cannot retry forever without spending an attempt toward escalation; only the schedule moves, and only when the new rendering carries a usable reset time.
+
 A usage-limit stall waits for the reset time its own banner names, plus `FM_STALL_RESET_SETTLE`.
 That wait is bounded by `FM_STALL_MAX_RESET_WAIT`, because a banner names a time of day and not a date: one that has already passed today rolls to tomorrow, and read shortly after its own reset that would park a worker whose window has just reopened for a full day.
 Past the bound the ladder takes over, so being early costs one attempt while being a day late would cost the whole point of unattended recovery.

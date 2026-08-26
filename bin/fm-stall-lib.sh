@@ -31,18 +31,43 @@
 # question or permission dialog, and a pane with text already typed into it out
 # of the auto-resume path entirely.
 #
+# ADJACENCY. A stall banner counts only when it sits IMMEDIATELY above the
+# composer, with nothing but blank rows, box-drawing rows, and composer chrome
+# between them. Claude keeps old banners in its transcript after a SUCCESSFUL
+# resume, so a banner floating mid-scrollback is history, not a live error; a
+# recovered worker's own output separates its composer from any stale banner and
+# the classification reads none. A banner wider than one terminal row is allowed
+# one continuation row directly beneath it, because upstream 5xx banners embed a
+# JSON blob that wraps. Detection degrades to "no stall" on anything else, which
+# is the safe direction: a missed auto-resume surfaces through the ordinary
+# stale path, while a spurious nudge types into a healthy worker.
+#
 # EPISODE MODEL. All scheduling state for one task lives in a single line at
 # state/<id>.stall, atomically replaced:
 #
-#   v1 class=<limit|overload> attempts=<uint> next=<epoch> first=<epoch> \
-#      last=<epoch> escalated=<0|1> quiet=<epoch|0>
+#   v2 class=<limit|overload> attempts=<uint> next=<epoch> first=<epoch> \
+#      last=<epoch> escalated=<0|1> quiet=<epoch|0> sent=<digest|0>
 #
 # One episode spans a stall and every resume attempt against it. `quiet` marks
 # when the stall was last seen GONE; the record is only discarded, and the
 # ladder only restarts at its first rung, once the worker has been clear for
 # FM_STALL_EPISODE_RESET. Without that, a worker that resumes, immediately
 # re-stalls, and re-stalls again would restart at the 2-minute rung forever -
-# exactly the tight loop the ladder exists to prevent.
+# exactly the tight loop the ladder exists to prevent. While the stall is still
+# showing, quiet is forced back to zero even on polls that decline to act (a
+# pending composer), so a continuously-stalling episode can never age out and
+# read as freshly recovered. `sent` records the pane digest at the last resume
+# delivery: a due attempt against a byte-identical pane is refused (`unchanged`),
+# because re-typing into a pane nothing has changed since the last nudge adds no
+# information. Such an episode stops owning its polls, handing the wedge to the
+# ordinary stale path - which is the escalation for it, since a pane that never
+# moved after a delivery is a worker that never got it.
+#
+# A CHANGE OF STALL CLASS does not restart the ladder. limit and overload are
+# two renderings of the same ongoing trouble, and flapping between them must not
+# spend nothing while resetting attempts to zero forever. Only a genuinely new
+# episode - no record, or a full FM_STALL_EPISODE_RESET of quiet - starts back
+# at the first rung.
 #
 # ESCALATION. After FM_STALL_MAX_ATTEMPTS resumes against the same episode the
 # ladder is spent, the episode is marked escalated, and this library stops
@@ -55,7 +80,7 @@
 # shellcheck source=bin/fm-composer-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-composer-lib.sh"
 
-FM_STALL_LIB_VERSION=v1
+FM_STALL_LIB_VERSION=v2
 
 # Non-blank rendered lines scanned for a stall banner, counted back from the end
 # of the capture. Bounded on purpose: a stall banner sits immediately above the
@@ -124,9 +149,86 @@ fm_stall_enabled() {  # <config-dir> <harness>
 
 # --- rendered-banner classification ----------------------------------------
 
-# fm_stall_focus: stdin raw capture -> stdout the bounded plain-text scan window.
-fm_stall_focus() {
-  fm_composer_strip_ansi | grep -v '^[[:space:]]*$' | tail -n "$FM_STALL_SCAN_LINES"
+# fm_stall_pane_digest <capture> -> a stable digest of the raw pane bytes. The
+# re-trigger guard compares this against the digest recorded at the last resume
+# delivery, so the same capture must hash the same on every poll.
+fm_stall_pane_digest() {  # <capture>
+  if command -v md5 >/dev/null 2>&1; then printf '%s' "$1" | md5 -q
+  else printf '%s' "$1" | md5sum | cut -d' ' -f1; fi
+}
+
+# Composer footer hints Claude renders beneath or around its composer, matched
+# as fixed lowercase substrings of the row.
+
+# fm_stall_row_is_chrome <plain-row>: 0 when the row is part of the composer's
+# own rendering rather than content above it: blank, box-drawing border, a bare
+# prompt glyph, a row drawn between the composer box's vertical borders, or a
+# footer hint line.
+fm_stall_row_is_chrome() {  # <plain-row>
+  local row=$1 body lc
+  body=${row//[[:space:]]/}
+  [ -n "$body" ] || return 0
+  case $body in
+    *[!╭╮╰╯─━│┃┏┓┗┛┣┫┬┴┼═║╌┈┄]*) ;;
+    *) return 0 ;;
+  esac
+  case $body in
+    ❯|›|⟩|'>'|'$'|'%'|'#') return 0 ;;
+  esac
+  # A row drawn between the composer box's vertical borders is the box itself,
+  # whatever its interior holds (an empty prompt, ghost text, or input someone
+  # typed); whether that input blocks a resume is the caller's composer gate,
+  # not this classifier's business.
+  case $body in
+    │*│) return 0 ;;
+  esac
+  lc=$(printf '%s' "$row" | tr '[:upper:]' '[:lower:]')
+  case $lc in
+    *for\ shortcuts*|*context\ left*|*accept\ edits*|*plan\ mode*|*auto-accept*|*shift+tab*|*esc\ to*) return 0 ;;
+  esac
+  return 1
+}
+
+# A wrapped banner's upper row ends mid-rendering, so its last character is
+# punctuation from inside the error payload (JSON delimiters, an underscore from
+# a cut identifier). Finished worker output above a stale banner ends in a word
+# or a full stop, so requiring this artifact is what keeps the one-row wrap
+# allowance from re-opening the false positive adjacency exists to close.
+FM_STALL_WRAP_CUT_RE='[][_,:;"({-]$'
+
+# fm_stall_banner_zone <capture> -> stdout the stall-banner text hugging the
+# composer, empty when none does. Walks up from the end of the ANSI-stripped
+# capture past chrome rows; the first substantive row must carry a banner, or be
+# the wrapped continuation of one in the row directly above it (upstream 5xx
+# renderings embed a JSON blob wide enough to wrap). Bounded by
+# FM_STALL_SCAN_LINES rows.
+fm_stall_banner_zone() {  # <capture>
+  local r r0='' r1='' i seen=0
+  local -a tail_rows=()
+  while IFS= read -r r; do tail_rows+=("$r"); done \
+    < <(printf '%s\n' "$1" | fm_composer_strip_ansi | tail -n "$FM_STALL_SCAN_LINES")
+  for (( i=${#tail_rows[@]} - 1; i >= 0; i-- )); do
+    r=${tail_rows[i]}
+    fm_stall_row_is_chrome "$r" && continue
+    if [ "$seen" -eq 0 ]; then
+      r0=$r
+      seen=1
+      continue
+    fi
+    r1=$r
+    break
+  done
+  [ "$seen" -eq 1 ] || return 0
+  if printf '%s\n' "$r0" | grep -qiE "$FM_STALL_LIMIT_RE|$FM_STALL_OVERLOAD_RE"; then
+    printf '%s\n' "$r0"
+    return 0
+  fi
+  if [ -n "$r1" ] && [[ $r1 =~ $FM_STALL_WRAP_CUT_RE ]] \
+    && printf '%s %s\n' "$r1" "$r0" | grep -qiE "$FM_STALL_LIMIT_RE|$FM_STALL_OVERLOAD_RE"; then
+    printf '%s %s\n' "$r1" "$r0"
+    return 0
+  fi
+  return 0
 }
 
 # Usage-limit phrasings observed across Claude's limit banners, plus the older
@@ -139,20 +241,21 @@ FM_STALL_LIMIT_RE='(usage|session|weekly|opus|sonnet|[0-9]+-hour) limit reached|
 FM_STALL_OVERLOAD_RE='api[ _-]?error[^0-9a-z]{0,24}5[0-9][0-9]|overloaded_error|5[0-9][0-9][^a-z0-9]{0,12}(overloaded|service unavailable|internal server error|bad gateway|gateway timeout)|api[ _-]?error[^a-z0-9]{0,4}(overloaded|service unavailable)'
 
 # fm_stall_classify <capture> [now-epoch] -> "<class> <detail>"
-#   none unknown            no stall banner in the scan window
+#   none unknown            no stall banner hugs the composer
 #   limit <epoch|unknown>   usage-limit banner; detail is the parsed reset time
 #   overload <5xx|5xx-code> transient upstream error banner
 fm_stall_classify() {  # <capture> [now-epoch]
-  local capture=${1:-} now=${2:-} focus code reset
+  local capture=${1:-} now=${2:-} zone code reset
   [ -n "$now" ] || now=$(date +%s)
-  focus=$(printf '%s\n' "$capture" | fm_stall_focus)
-  if printf '%s\n' "$focus" | grep -qiE "$FM_STALL_LIMIT_RE"; then
-    reset=$(fm_stall_parse_reset "$focus" "$now")
+  zone=$(fm_stall_banner_zone "$capture")
+  [ -n "$zone" ] || { printf 'none unknown\n'; return 0; }
+  if printf '%s\n' "$zone" | grep -qiE "$FM_STALL_LIMIT_RE"; then
+    reset=$(fm_stall_parse_reset "$zone" "$now")
     printf 'limit %s\n' "${reset:-unknown}"
     return 0
   fi
-  if printf '%s\n' "$focus" | grep -qiE "$FM_STALL_OVERLOAD_RE"; then
-    code=$(printf '%s\n' "$focus" | grep -oiE "$FM_STALL_OVERLOAD_RE" | grep -oE '5[0-9][0-9]' | head -n 1)
+  if printf '%s\n' "$zone" | grep -qiE "$FM_STALL_OVERLOAD_RE"; then
+    code=$(printf '%s\n' "$zone" | grep -oiE "$FM_STALL_OVERLOAD_RE" | grep -oE '5[0-9][0-9]' | head -n 1)
     printf 'overload %s\n' "${code:-5xx}"
     return 0
   fi
@@ -213,6 +316,14 @@ fm_stall_parse_reset() {  # <text> <now-epoch>
   hh=$(printf '%s' "$tok" | grep -oE '^[0-9]{1,2}')
   mm=$(printf '%s' "$tok" | grep -oE ':[0-9]{2}' | tr -d ':')
   [ -n "$mm" ] || mm=00
+  # Force base 10 BEFORE any arithmetic: bash reads a leading zero as octal, so
+  # "09:30" would die in $(( )) and "printf '%02d' 09" would misparse, turning a
+  # real reset time into no reset at all.
+  case "$hh$mm" in *[!0-9]*|'') return 0 ;; esac
+  hh=$((10#$hh))
+  mm=$((10#$mm))
+  [ "$hh" -le 23 ] || return 0
+  [ "$mm" -le 59 ] || return 0
   case "$meridiem" in
     am) if [ "$hh" -eq 12 ]; then hour24=0; else hour24=$hh; fi ;;
     pm) if [ "$hh" -eq 12 ]; then hour24=12; else hour24=$((hh + 12)); fi ;;
@@ -280,12 +391,15 @@ fm_stall_uint() {  # <value> <default>
   esac
 }
 
-fm_stall_write() {  # <state-dir> <id> <class> <attempts> <next> <first> <last> <escalated> <quiet>
+# fm_stall_write <state-dir> <id> <class> <attempts> <next> <first> <last>
+#   <escalated> <quiet> <sent>: atomically replace the episode record. <sent> is
+# the raw pane digest recorded at the last resume delivery, or 0 for none yet.
+fm_stall_write() {  # <state-dir> <id> <class> <attempts> <next> <first> <last> <escalated> <quiet> <sent>
   local dir=$1 id=$2 file tmp
   file=$(fm_stall_record_path "$dir" "$id")
   tmp="$file.tmp.$$"
-  printf '%s class=%s attempts=%s next=%s first=%s last=%s escalated=%s quiet=%s\n' \
-    "$FM_STALL_LIB_VERSION" "$3" "$4" "$5" "$6" "$7" "$8" "$9" > "$tmp" 2>/dev/null || return 1
+  printf '%s class=%s attempts=%s next=%s first=%s last=%s escalated=%s quiet=%s sent=%s\n' \
+    "$FM_STALL_LIB_VERSION" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" > "$tmp" 2>/dev/null || return 1
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   return 0
 }
@@ -300,10 +414,11 @@ fm_stall_clear() {  # <state-dir> <id>
 # FM_STALL_EPISODE_RESET, so a resume that works for thirty seconds and stalls
 # again continues the same ladder instead of restarting it.
 fm_stall_note_clear() {  # <state-dir> <id> <now>
-  local dir=$1 id=$2 now=$3 quiet
+  local dir=$1 id=$2 now=$3 quiet sent
   [ -f "$(fm_stall_record_path "$dir" "$id")" ] || return 0
   quiet=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" quiet)" 0)
   if [ "$quiet" -eq 0 ]; then
+    sent=$(fm_stall_field "$dir" "$id" sent)
     fm_stall_write "$dir" "$id" \
       "$(fm_stall_field "$dir" "$id" class)" \
       "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" attempts)" 0)" \
@@ -311,7 +426,8 @@ fm_stall_note_clear() {  # <state-dir> <id> <now>
       "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" first)" "$now")" \
       "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" last)" "$now")" \
       "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" escalated)" 0)" \
-      "$now"
+      "$now" \
+      "${sent:-0}"
     return 0
   fi
   if [ "$((now - quiet))" -ge "$FM_STALL_EPISODE_RESET" ]; then
@@ -320,23 +436,55 @@ fm_stall_note_clear() {  # <state-dir> <id> <now>
   return 0
 }
 
-# fm_stall_plan <state-dir> <id> <class> <detail> <now> -> "<verdict> <arg>"
+# fm_stall_note_showing <state-dir> <id> <now>: record that the stall banner is
+# STILL showing on this poll even though the caller declined to act on it (the
+# composer was not provably empty). This enforces the invariant that an episode
+# whose stall is still showing is never treated as newly clear: without it, a
+# long pending-composer stretch would leave an older `quiet` timestamp in place,
+# and once it aged past FM_STALL_EPISODE_RESET the still-stalling episode would
+# be discarded and re-armed at the first rung as if the worker had recovered.
+fm_stall_note_showing() {  # <state-dir> <id> <now>
+  local dir=$1 id=$2 now=$3 quiet sent
+  [ -f "$(fm_stall_record_path "$dir" "$id")" ] || return 0
+  quiet=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" quiet)" 0)
+  [ "$quiet" -ne 0 ] || return 0
+  sent=$(fm_stall_field "$dir" "$id" sent)
+  fm_stall_write "$dir" "$id" \
+    "$(fm_stall_field "$dir" "$id" class)" \
+    "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" attempts)" 0)" \
+    "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" next)" "$now")" \
+    "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" first)" "$now")" \
+    "$now" \
+    "$(fm_stall_uint "$(fm_stall_field "$dir" "$id" escalated)" 0)" \
+    0 \
+    "${sent:-0}"
+}
+
+# fm_stall_plan <state-dir> <id> <class> <detail> <now> [pane-digest]
+#   -> "<verdict> <arg>"
 #   armed <seconds>      this poll OPENED the episode and scheduled its first
 #                        attempt; reported separately from `wait` so a caller can
 #                        log the transition once rather than on every poll of a
-#                        wait that may legitimately last hours
+#                        wait that may legitimately run for hours
 #   wait <seconds>       the scheduled attempt is not due yet; nothing to do
 #   resume <attempt>     attempt number <attempt> (0-based) is due now
+#   unchanged <seconds>  an attempt is due but the pane has not changed by one
+#                        byte since the last delivery; refuse to re-nudge. The
+#                        verdict releases the window back to ordinary
+#                        supervision, which is the escalation for it: a pane
+#                        that never moved after a delivery belongs to a worker
+#                        that never got it
 #   escalate <attempts>  the ladder is spent; hand this worker to a human
 #   escalated <attempts> already escalated; this library is done with it
 # Records the episode as a side effect. The caller must call
-# fm_stall_commit_attempt after acting on a `resume`.
-fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now>
-  local dir=$1 id=$2 class=$3 detail=$4 now=$5
-  local prev_class attempts next first escalated quiet reset
+# fm_stall_commit_attempt after acting on a `resume`. The digest argument is
+# optional; without it the re-trigger guard is inert and every due attempt fires.
+fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now> [pane-digest]
+  local dir=$1 id=$2 class=$3 detail=$4 now=$5 digest=${6:-}
+  local prev_class attempts next first escalated quiet sent reset
   prev_class=$(fm_stall_field "$dir" "$id" class)
   quiet=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" quiet)" 0)
-  if [ -z "$prev_class" ] || [ "$prev_class" != "$class" ] \
+  if [ -z "$prev_class" ] \
     || { [ "$quiet" -gt 0 ] && [ "$((now - quiet))" -ge "$FM_STALL_EPISODE_RESET" ]; }; then
     reset=$(fm_stall_reset_epoch "$class" "$detail" "$now")
     if [ -n "$reset" ]; then
@@ -344,7 +492,7 @@ fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now>
     else
       next=$((now + $(fm_stall_backoff_delay 0)))
     fi
-    fm_stall_write "$dir" "$id" "$class" 0 "$next" "$now" "$now" 0 0 || return 1
+    fm_stall_write "$dir" "$id" "$class" 0 "$next" "$now" "$now" 0 0 0 || return 1
     printf 'armed %s\n' "$((next - now))"
     return 0
   fi
@@ -352,21 +500,42 @@ fm_stall_plan() {  # <state-dir> <id> <class> <detail> <now>
   next=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" next)" "$now")
   first=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" first)" "$now")
   escalated=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" escalated)" 0)
+  sent=$(fm_stall_field "$dir" "$id" sent)
+  sent=${sent:-0}
   if [ "$escalated" -ne 0 ]; then
     printf 'escalated %s\n' "$attempts"
     return 0
   fi
+  # limit and overload are two renderings of one ongoing stall. Adopting the
+  # new class must KEEP the ladder position: resetting attempts to zero here let
+  # a pane flapping between renderings restart the ladder forever without ever
+  # spending an attempt toward escalation. Only the schedule moves when the new
+  # rendering carries usable information - a valid reset time - and otherwise
+  # the rung already pending stands.
+  if [ "$prev_class" != "$class" ]; then
+    reset=$(fm_stall_reset_epoch "$class" "$detail" "$now")
+    if [ -n "$reset" ]; then
+      next=$((reset + FM_STALL_RESET_SETTLE))
+    fi
+  fi
   # The stall is showing again, so this episode is not quiet any more.
-  if [ "$quiet" -ne 0 ]; then
-    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 0 0 || return 1
+  if [ "$quiet" -ne 0 ] || [ "$prev_class" != "$class" ]; then
+    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 0 0 "$sent" || return 1
   fi
   if [ "$now" -lt "$next" ]; then
     printf 'wait %s\n' "$((next - now))"
     return 0
   fi
   if [ "$attempts" -ge "$FM_STALL_MAX_ATTEMPTS" ]; then
-    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 1 0 || return 1
+    fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 1 0 "$sent" || return 1
     printf 'escalate %s\n' "$attempts"
+    return 0
+  fi
+  # Re-trigger guard: a due attempt against a pane that has not changed since
+  # the last delivery adds no information, so refuse it rather than re-typing
+  # into a worker that never received the previous nudge.
+  if [ -n "$digest" ] && [ "$sent" != 0 ] && [ "$sent" = "$digest" ]; then
+    printf 'unchanged %s\n' "$((next - now))"
     return 0
   fi
   printf 'resume %s\n' "$attempts"
@@ -386,13 +555,14 @@ fm_stall_reset_epoch() {  # <class> <detail> <now>
   printf '%s' "$detail"
 }
 
-# fm_stall_commit_attempt <state-dir> <id> <class> <detail> <now>: record that a
-# resume was just attempted and schedule the next rung. Called for a failed
-# delivery too: a send that did not land is a spent attempt, so a wedged
-# endpoint walks the same bounded ladder to escalation instead of retrying
-# every poll.
-fm_stall_commit_attempt() {  # <state-dir> <id> <class> <detail> <now>
-  local dir=$1 id=$2 class=$3 detail=$4 now=$5 attempts first next reset
+# fm_stall_commit_attempt <state-dir> <id> <class> <detail> <now>
+#                         [pane-digest]: record that a resume was just attempted
+# and schedule the next rung. Called for a failed delivery too: a send that did
+# not land is a spent attempt, so a wedged endpoint walks the same bounded
+# ladder to escalation instead of retrying every poll. The digest records what
+# the pane looked like at delivery time, arming the re-trigger guard.
+fm_stall_commit_attempt() {  # <state-dir> <id> <class> <detail> <now> [pane-digest]
+  local dir=$1 id=$2 class=$3 detail=$4 now=$5 digest=${6:-} attempts first next reset
   attempts=$(( $(fm_stall_uint "$(fm_stall_field "$dir" "$id" attempts)" 0) + 1 ))
   first=$(fm_stall_uint "$(fm_stall_field "$dir" "$id" first)" "$now")
   reset=$(fm_stall_reset_epoch "$class" "$detail" "$now")
@@ -401,7 +571,7 @@ fm_stall_commit_attempt() {  # <state-dir> <id> <class> <detail> <now>
   else
     next=$((now + $(fm_stall_backoff_delay "$attempts")))
   fi
-  fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 0 0
+  fm_stall_write "$dir" "$id" "$class" "$attempts" "$next" "$first" "$now" 0 0 "${digest:-0}"
 }
 
 # fm_stall_resume_text <class> -> the single-line steer sent to the worker.

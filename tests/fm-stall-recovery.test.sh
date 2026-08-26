@@ -172,6 +172,52 @@ All 12 tests passed.')" = "none unknown" ] || fail "ordinary output classified a
   pass "displayed content without live error framing is never a stall"
 }
 
+test_a_banner_must_hug_the_composer() {
+  local boxed wrapped buried
+  # A banner sitting directly above the composer, with only blank and box rows
+  # between them, is a pane genuinely resting on the error.
+  boxed="You've hit your usage limit · resets 3pm (America/Toronto)
+
+╭──────────────────────╮
+│ >                    │
+╰──────────────────────╯
+ ? for shortcuts"
+  local out
+  out=$(classify "$boxed")
+  [ "${out%% *}" = limit ] || fail "a banner hugging the composer did not classify: $out"
+
+  # Claude keeps old banners in its transcript after a SUCCESSFUL resume. A
+  # banner with the worker's own output between it and the composer is history,
+  # not a live error; classifying it re-nudged recovered workers.
+  buried='  ⎿  API Error: 529 overloaded_error
+the fix landed and all checks are green
+line two of ordinary output
+
+❯'
+  [ "$(classify "$buried")" = "none unknown" ] \
+    || fail "a banner buried above later output classified as a live stall"
+
+  # Upstream 5xx renderings embed a JSON blob wide enough to wrap, so the error
+  # framing may sit one row above the banner's last rendered row.
+  wrapped='API Error: 529 {"type":"error","error":{"type":"overloaded_
+error","message":"Overloaded"}}
+
+❯'
+  [ "$(classify "$wrapped")" = "overload 529" ] \
+    || fail "a wrapped overload banner hugging the composer did not classify"
+
+  # The wrap allowance must not re-open the buried-banner false positive: a
+  # finished sentence above a stale banner is worker output, not a truncated
+  # payload row, and its final full stop proves it.
+  prose='  ⎿  API Error: 529 overloaded_error
+Fixed the retry logic.
+
+❯'
+  [ "$(classify "$prose")" = "none unknown" ] \
+    || fail "a stale banner under finished output classified as a live stall"
+  pass "only a banner hugging the composer classifies as a live stall"
+}
+
 test_the_banner_scan_window_is_bounded() {
   local scrolled i
   scrolled='API Error: 529 overloaded_error'
@@ -179,9 +225,29 @@ test_the_banner_scan_window_is_bounded() {
 line $i of ordinary output"; done
   [ "$(classify "$scrolled")" = "none unknown" ] \
     || fail "a banner scrolled far above the composer still classified as a live stall"
-  [ "$(FM_STALL_SCAN_LINES=40 fm_stall_classify "$scrolled" "$REF_NOW")" = "overload 529" ] \
-    || fail "widening the scan window did not reach the same banner"
+  # Widening the window must not bring history back to life: adjacency to the
+  # composer, not scan width, is what separates a live banner from an old one.
+  [ "$(FM_STALL_SCAN_LINES=40 fm_stall_classify "$scrolled" "$REF_NOW")" = "none unknown" ] \
+    || fail "widening the scan window resurrected a scrolled-away banner"
   pass "banner scanning is bounded to the rows just above the composer"
+}
+
+test_leading_zero_reset_times_parse_in_base_ten() {
+  # Bash reads a leading zero as octal: "09:30" once died in arithmetic and
+  # misparsed through printf, turning a real reset time into no reset at all.
+  local out n
+  n=$(now_at '2026-08-24 08:00:00')
+  out=$(fm_stall_parse_reset 'usage limit reached · resets at 09:30' "$n")
+  [ -n "$out" ] || fail "a leading-zero reset time produced no reset at all"
+  [ "$(at_local "$out")" = "2026-08-24 09:30" ] \
+    || fail "a leading-zero hour was not read in base ten: $(at_local "$out")"
+  out=$(fm_stall_parse_reset 'resets 08:30pm' "$n")
+  [ "$(at_local "$out")" = "2026-08-24 20:30" ] \
+    || fail "a leading-zero hour with a meridiem was not read in base ten: $(at_local "$out")"
+  out=$(fm_stall_parse_reset 'resets at 09:05am' "$n")
+  [ "$(at_local "$out")" = "2026-08-24 09:05" ] \
+    || fail "a leading-zero minute was not preserved: $(at_local "$out")"
+  pass "reset times with leading zeros parse in base ten"
 }
 
 test_unparseable_reset_times_degrade_to_no_reset() {
@@ -288,6 +354,34 @@ test_an_episode_survives_a_brief_clear_and_restarts_after_a_long_one() {
   pass "an episode survives a brief clear and restarts only after a full clear window"
 }
 
+test_a_still_showing_stall_is_never_marked_clear() {
+  local d id n quiet_t
+  d="$TMP_ROOT/episode-showing/state"; mkdir -p "$d"; id=task; n=1000000
+  fm_stall_plan "$d" "$id" overload 529 "$n" >/dev/null
+  fm_stall_commit_attempt "$d" "$id" overload 529 "$((n + 120))"
+  # A moment of recovery stamps quiet...
+  fm_stall_note_clear "$d" "$id" "$((n + 130))"
+  quiet_t=$(fm_stall_field "$d" "$id" quiet)
+  [ "$quiet_t" != 0 ] || fail "the clear poll did not stamp quiet"
+  # ...but a poll that sees the stall showing again while declining to act
+  # (a composer that was not provably empty) must un-stamp it: otherwise the
+  # still-stalling episode would age out and later re-arm as if the worker had
+  # recovered, restarting the ladder it had already half spent.
+  fm_stall_note_showing "$d" "$id" "$((n + 200))"
+  [ "$(fm_stall_field "$d" "$id" quiet)" = 0 ] \
+    || fail "a declined poll left the episode marked as quietly clearing"
+  [ "$(fm_stall_field "$d" "$id" attempts)" = 1 ] \
+    || fail "noting a showing stall disturbed the ladder position"
+  [ "$(fm_stall_field "$d" "$id" last)" = "$((n + 200))" ] \
+    || fail "noting a showing stall did not record when it was seen"
+  # With no quiet timestamp to un-stamp, the call is a no-op that preserves
+  # every field.
+  fm_stall_note_showing "$d" "$id" "$((n + 300))"
+  [ "$(fm_stall_field "$d" "$id" first)" = "$n" ] \
+    || fail "re-noting a showing stall rewrote the episode's history"
+  pass "a poll that declines while the stall is showing keeps the episode honestly stalled"
+}
+
 test_a_limit_episode_schedules_its_first_attempt_for_the_reset() {
   local d id n reset
   d="$TMP_ROOT/episode-limit/state"; mkdir -p "$d"; id=task; n=1000000; reset=$((n + 3600))
@@ -310,11 +404,83 @@ test_a_damaged_or_foreign_record_reads_as_a_fresh_episode() {
   printf 'garbage not a record\n' > "$(fm_stall_record_path "$d" "$id")"
   [ "$(fm_stall_plan "$d" "$id" overload 529 "$n")" = "armed 120" ] \
     || fail "a corrupt record did not read as a fresh episode"
-  # A different stall class is a different problem and gets its own schedule.
-  [ "$(fm_stall_plan "$d" "$id" limit unknown "$n")" = "armed 120" ] \
-    || fail "a class change did not start a fresh episode"
-  [ "$(fm_stall_field "$d" "$id" class)" = limit ] || fail "the record did not adopt the new class"
-  pass "a damaged record, and a change of stall class, each read as a fresh episode"
+  # A record written by the previous schema version is foreign too: reading it
+  # as a fresh episode costs one ladder position at upgrade, while trusting
+  # misaligned fields could schedule anything.
+  printf 'v1 class=overload attempts=3 next=1 first=1 last=1 escalated=0 quiet=0\n' \
+    > "$(fm_stall_record_path "$d" "$id")"
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$n")" = "armed 120" ] \
+    || fail "a previous-version record did not read as a fresh episode"
+  [ "$(fm_stall_field "$d" "$id" attempts)" = 0 ] \
+    || fail "a previous-version record leaked its attempts into the new schema"
+  pass "a damaged or previous-version record reads as a fresh episode"
+}
+
+test_a_class_change_keeps_the_ladder_position() {
+  local d id n reset v
+  d="$TMP_ROOT/episode-switch/state"; mkdir -p "$d"; id=task; n=1000000; reset=$((n + 3600))
+  fm_stall_plan "$d" "$id" overload 529 "$n" >/dev/null
+  fm_stall_commit_attempt "$d" "$id" overload 529 "$((n + 120))"
+  [ "$(fm_stall_field "$d" "$id" attempts)" = 1 ] || fail "the attempt was not recorded"
+  # The same trouble re-rendered as a usage-limit banner adopts the usable reset
+  # time but keeps the spent attempt: restarting the ladder here let a pane
+  # flapping between renderings retry forever without ever escalating.
+  [ "$(fm_stall_plan "$d" "$id" limit "$reset" "$((n + 130))")" = "wait $((3600 + FM_STALL_RESET_SETTLE - 130))" ] \
+    || fail "adopting a limit rendering did not schedule for its reset"
+  [ "$(fm_stall_field "$d" "$id" attempts)" = 1 ] \
+    || fail "a change of stall class restarted the ladder"
+  [ "$(fm_stall_field "$d" "$id" class)" = limit ] \
+    || fail "the record did not adopt the new class"
+  # Switching back, with no usable reset time, keeps the pending rung: losing
+  # the banner's clock does not invalidate a schedule already made for the same
+  # trouble, and keeping it is what keeps a flapping pane bounded.
+  [ "$(fm_stall_plan "$d" "$id" overload 5xx "$((n + 140))")" = "wait $((3660 - 140))" ] \
+    || fail "a class change did not keep its pending rung"
+  # And the ladder stays bounded: enough dues still escalate, whichever way the
+  # pane renders them.
+  local i now=$((n + 100000))
+  for i in 1 2 3 4; do
+    case $((i % 2)) in
+      0) v=$(fm_stall_plan "$d" "$id" limit unknown "$now") ;;
+      *) v=$(fm_stall_plan "$d" "$id" overload 529 "$now") ;;
+    esac
+    case $v in resume*) fm_stall_commit_attempt "$d" "$id" overload 529 "$now" ;; esac
+    now=$((now + 100000))
+  done
+  [ "$(fm_stall_field "$d" "$id" escalated)" = 1 ] \
+    || fail "a flapping pane never reached escalation"
+  pass "a change of stall class keeps the ladder position and stays bounded"
+}
+
+test_an_unchanged_pane_refuses_a_due_resume() {
+  local d id n dg dg2
+  d="$TMP_ROOT/episode-unchanged/state"; mkdir -p "$d"; id=task; n=1000000
+  dg=$(printf 'pane bytes\n' | md5 -q)
+  dg2=$(printf 'different pane bytes\n' | md5 -q)
+  [ "$dg" != "$dg2" ] || fail "digest fixtures collided"
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$n")" = "armed 120" ] \
+    || fail "the episode did not arm"
+  # Before any delivery there is nothing to compare against: the guard is inert.
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$((n + 120))" "$dg")" = "resume 0" ] \
+    || fail "the guard fired before any delivery had been made"
+  fm_stall_commit_attempt "$d" "$id" overload 529 "$((n + 120))" "$dg"
+  [ "$(fm_stall_field "$d" "$id" sent)" = "$dg" ] \
+    || fail "committing an attempt did not record the pane digest"
+  # Same bytes at the next due rung: refuse. Re-typing into a pane that has not
+  # changed since the last delivery adds no information.
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$((n + 420))" "$dg")" = "unchanged 0" ] \
+    || fail "an unchanged pane was resumed again"
+  # The pane moved: the next rung is genuinely due.
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$((n + 420))" "$dg2")" = "resume 1" ] \
+    || fail "a changed pane was blocked by the re-trigger guard"
+  # A spent ladder escalates even when the pane is frozen: a worker that never
+  # moved after four deliveries needs a human, not silence.
+  rm -f "$(fm_stall_record_path "$d" "$id")"
+  printf '%s class=overload attempts=4 next=1 first=1 last=1 escalated=0 quiet=0 sent=%s\n' \
+    "$FM_STALL_LIB_VERSION" "$dg" > "$(fm_stall_record_path "$d" "$id")"
+  [ "$(fm_stall_plan "$d" "$id" overload 529 "$n" "$dg")" = "escalate 4" ] \
+    || fail "an unchanged pane hid a spent ladder from escalation"
+  pass "a byte-identical pane refuses a due resume without hiding escalation"
 }
 
 # --- watcher wiring, end to end -------------------------------------------
@@ -543,8 +709,8 @@ test_a_spent_ladder_surfaces_one_stale_wake_carrying_its_history() {
   cy=$(write_pane "$pane" bare "" '  ⎿  API Error: 529 overloaded_error')
   arm_claude_task "$state" spent "$window" idle stop-failure
   # An episode whose attempts are already spent and whose next attempt is due.
-  printf 'v1 class=overload attempts=4 next=1 first=1 last=1 escalated=0 quiet=0\n' \
-    > "$state/spent.stall"
+  printf '%s class=overload attempts=4 next=1 first=1 last=1 escalated=0 quiet=0 sent=0\n' \
+    "$FM_STALL_LIB_VERSION" > "$state/spent.stall"
 
   stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out" FM_STALL_MAX_ATTEMPTS=4
   local pid=$!
@@ -584,14 +750,21 @@ test_a_working_pane_is_never_resumed() {
   # An episode left over from an earlier stall. A resumed worker spends most of
   # its polls busy, so if a busy poll did not clear the episode it would never
   # close, and a stall hours later would inherit a half-spent ladder.
-  printf 'v1 class=overload attempts=2 next=1 first=1 last=1 escalated=0 quiet=0\n' \
-    > "$state/busy.stall"
+  printf '%s class=overload attempts=2 next=1 first=1 last=1 escalated=0 quiet=0 sent=0\n' \
+    "$FM_STALL_LIB_VERSION" > "$state/busy.stall"
   stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
   local pid=$!
-  sleep 3
+  # Wait for the clear to land rather than sleeping a guessed interval: a busy
+  # poll must stamp quiet on the open episode, and on a loaded machine the
+  # watcher's first poll can legitimately land many seconds after launch.
+  local i quiet="" ok=""
+  for i in $(seq 1 200); do
+    quiet=$(fm_stall_field "$state" busy quiet)
+    if [ -n "$quiet" ] && [ "$quiet" != 0 ]; then ok=1; break; fi
+    sleep 0.1
+  done
+  [ "$ok" = 1 ] || { reap "$pid"; fail "a producing worker did not clear its open stall episode: $(cat "$out")"; }
   [ ! -s "$dir/sent.log" ] || { reap "$pid"; fail "a pane whose worker is still mid-turn was auto-resumed"; }
-  [ "$(fm_stall_field "$state" busy quiet)" != 0 ] \
-    || { reap "$pid"; fail "a producing worker did not clear its open stall episode"; }
   [ "$(fm_stall_field "$state" busy attempts)" = 2 ] \
     || { reap "$pid"; fail "clearing an episode discarded its spent attempts"; }
   reap "$pid"
@@ -602,18 +775,69 @@ test_a_pane_with_text_already_in_its_composer_is_never_resumed() {
   local dir state window pane out cy
   dir=$(make_stall_case pending-composer); state="$dir/state"
   window="test:fm-pending"; pane="$dir/pane.txt"; out="$dir/watch.out"
-  cy=$(write_pane "$pane" bare "please rerun the failing case" \
+  # The bordered shape is the one where a stall can genuinely hug a composer
+  # that is not empty: the typed text lives inside the box, so the banner above
+  # the box still hugs it and the classification fires. Whether the interior
+  # blocks the resume is the composer gate's call, asserted below.
+  cy=$(write_pane "$pane" boxed "please rerun the failing case" \
     '  ⎿  API Error: 529 overloaded_error')
   arm_claude_task "$state" pending "$window" idle stop-failure
   stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
   local pid=$!
-  sleep 3
   [ ! -s "$dir/sent.log" ] || { reap "$pid"; fail "a pane with text already typed was auto-resumed"; }
   [ ! -e "$state/pending.stall" ] || { reap "$pid"; fail "a pane with text already typed opened an episode"; }
-  wait_for_grep 'auto-resume declined for pending' "$state/.watch-triage.log" \
+  wait_for_grep 'auto-resume declined for pending' "$state/.watch-triage.log" 300 \
     || fail "the composer gate did not record why it declined: $(cat "$state/.watch-triage.log" 2>/dev/null)"
   reap "$pid"
   pass "a pane with text already in its composer is never auto-resumed"
+}
+
+test_a_recovered_workers_stale_banner_is_never_retriggered() {
+  local dir state window pane out cy
+  dir=$(make_stall_case buried-banner); state="$dir/state"
+  window="test:fm-recovered"; pane="$dir/pane.txt"; out="$dir/watch.out"
+  # A worker that already recovered: the old banner is still in its transcript,
+  # but its own output now sits between that banner and the composer. Nothing
+  # may be delivered, and because classification reads none, no episode is even
+  # opened - the ordinary stopped-crew supervision owns an idle pane like this.
+  cy=$(write_pane "$pane" bare "" \
+    '  ⎿  API Error: 529 overloaded_error' \
+    'the fix landed and all checks are green' \
+    'line two of ordinary output')
+  arm_claude_task "$state" recovered "$window" idle stop-failure
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  assert_never_resumed "$dir" "$state" recovered $! "a recovered worker whose transcript still shows a banner"
+  pass "a banner buried above later output never retriggers a recovered worker"
+}
+
+test_a_pane_unchanged_since_the_last_delivery_is_not_nudged_again() {
+  local dir state window pane out cy sent count
+  dir=$(make_stall_case unchanged-skip); state="$dir/state"
+  window="test:fm-static"; pane="$dir/pane.txt"; out="$dir/watch.out"; sent="$dir/sent.log"
+  cy=$(write_pane "$pane" bare "" '  ⎿  API Error: 529 overloaded_error')
+  arm_claude_task "$state" static "$window" idle stop-failure
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  local pid=$!
+  wait_for_file "$sent" 300 || { reap "$pid"; fail "the stalled pane was never resumed at all: $(cat "$out")"; }
+  # The ladder is compressed to one second, so within a few more polls the next
+  # rung comes due against the SAME bytes: the re-trigger guard must refuse it
+  # instead of typing into a pane the last steer visibly never moved. Wait for
+  # that refusal rather than sleeping a guessed interval.
+  local i refused=""
+  for i in $(seq 1 200); do
+    if grep -q 'pane unchanged since the last attempt' "$state/.watch-triage.log" 2>/dev/null; then
+      refused=1
+      break
+    fi
+    [ "$(wc -l < "$sent" | tr -d ' ')" = 1 ] || break   # an extra delivery: judged below
+    sleep 0.1
+  done
+  reap "$pid"
+  count=$(wc -l < "$sent" | tr -d ' ')
+  [ "$count" = 1 ] || fail "an unchanged pane was nudged $count times, not once: $(cat "$sent")"
+  [ "$refused" = 1 ] \
+    || fail "the refusal was not recorded: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  pass "a byte-identical pane receives one delivery, and further due rungs are refused"
 }
 
 test_a_non_claude_pane_is_never_resumed() {
@@ -646,18 +870,25 @@ test_a_reset_that_already_passed_does_not_park_the_worker_for_a_day
 test_a_limit_banner_outranks_an_overload_banner
 test_an_untimed_limit_still_classifies_but_carries_no_reset
 test_displayed_content_without_error_framing_is_not_a_stall
+test_a_banner_must_hug_the_composer
 test_the_banner_scan_window_is_bounded
 test_unparseable_reset_times_degrade_to_no_reset
+test_leading_zero_reset_times_parse_in_base_ten
 test_backoff_ladder_is_bounded_and_repeats_its_last_rung
 test_auto_resume_is_default_on_for_claude_only
 test_an_episode_walks_the_ladder_then_escalates_once
 test_an_episode_survives_a_brief_clear_and_restarts_after_a_long_one
+test_a_still_showing_stall_is_never_marked_clear
 test_a_limit_episode_schedules_its_first_attempt_for_the_reset
 test_a_damaged_or_foreign_record_reads_as_a_fresh_episode
+test_a_class_change_keeps_the_ladder_position
+test_an_unchanged_pane_refuses_a_due_resume
 test_an_overloaded_pane_is_resumed_without_waking_the_supervisor
 test_a_usage_limit_pane_waits_for_its_reset_instead_of_resuming
 test_a_spent_ladder_surfaces_one_stale_wake_carrying_its_history
 test_a_working_pane_is_never_resumed
 test_a_pane_with_text_already_in_its_composer_is_never_resumed
+test_a_recovered_workers_stale_banner_is_never_retriggered
+test_a_pane_unchanged_since_the_last_delivery_is_not_nudged_again
 test_a_non_claude_pane_is_never_resumed
 test_switching_auto_resume_off_leaves_the_pane_alone

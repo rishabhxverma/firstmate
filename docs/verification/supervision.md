@@ -193,6 +193,9 @@ Banner text can never cause a resume on its own: both structural gates must alre
 Each stall class also carries several independent phrasings rather than one vendor string, so a single rendering change cannot silently disable the path.
 An unrecognised banner classifies as no stall at all, and the pane then follows exactly the pre-existing stale path, so a rendering drift degrades to the manual recovery every home had before this change rather than to a wrong action.
 
+Position is part of that verification as well: the banner must hug the composer, and the regression pins both directions - a banner separated from the composer by the worker's own output classifies as no stall, while a banner with only blank rows, box borders, and composer rendering between it and the composer still fires.
+One wrapped row is allowed for the JSON-bearing upstream error form, gated on the upper row ending in a payload-punctuation artifact, so a finished line of output above a stale banner cannot masquerade as a wrapped banner.
+
 Refresh the third row after any Claude Code upgrade that changes how a limit or API-error turn end is rendered: capture the pane text from the affected worker, add the new phrasing to the banner families in `bin/fm-stall-lib.sh`, and pin it in the regression below.
 
 Deterministic entry point:

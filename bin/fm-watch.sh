@@ -472,11 +472,12 @@ surface_nonterminal_stale() {  # <window> <hash> [reason]
 # skips its normal stale classification: a worker waiting out its own usage-limit
 # window is not a wedge, and surfacing it every few minutes is exactly the noise
 # this replaces. Returns 1 for every other case - another harness, auto-resume
-# switched off, no banner, an unreadable composer, or an episode that has already
-# escalated - and the ordinary stale path then runs unchanged.
+# switched off, no banner, an unreadable composer, an episode that has already
+# escalated, or one whose due attempt found an unchanged pane - and the ordinary
+# stale path then runs unchanged.
 stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably working>
   local w=$1 task=$2 tail=$3 busy=$4 meta harness classification class detail
-  local now verdict arg composer text rc
+  local now verdict arg composer text rc digest
   local -a send_env
   [ -n "$task" ] || return 1
   meta="$STATE/$task.meta"
@@ -484,6 +485,7 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
   harness=$(fm_backend_meta_exact_value "$meta" harness 2>/dev/null || true)
   fm_stall_enabled "$CONFIG_DIR" "$harness" || return 1
   now=$(date +%s)
+  digest=$(fm_stall_pane_digest "$tail")
   if [ "$busy" -eq 0 ]; then
     # The worker is producing again, so this poll clears any open episode. It is
     # recorded here rather than skipped, because a resumed worker spends most of
@@ -501,10 +503,14 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
   fi
   composer=$(fm_backend_composer_state "$(window_backend "$w")" "$w" 2>/dev/null || true)
   if [ "$composer" != empty ]; then
+    # A banner hugging the composer but a composer that is not provably empty:
+    # decline, but record that the stall is still showing so the episode cannot
+    # quietly age out and later read as freshly recovered.
     triage_log "auto-resume declined for $task ($class stall, composer ${composer:-unreadable}): $w"
+    fm_stall_note_showing "$STATE" "$task" "$now"
     return 1
   fi
-  verdict=$(fm_stall_plan "$STATE" "$task" "$class" "$detail" "$now") || return 1
+  verdict=$(fm_stall_plan "$STATE" "$task" "$class" "$detail" "$now" "$digest") || return 1
   arg=${verdict#* }
   case "${verdict%% *}" in
     armed)
@@ -517,6 +523,14 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
       # size-capped triage log; the transition was already logged above.
       return 0
       ;;
+    unchanged)
+      # The pane has not changed by one byte since the last delivery, so another
+      # steer adds nothing. Release the window to ordinary supervision: if the
+      # worker truly never received the last nudge it will surface as stale,
+      # which is the escalation this case deserves.
+      triage_log "auto-resume skipped for $task ($class stall due, pane unchanged since the last attempt): $w"
+      return 1
+      ;;
     resume)
       text=$(fm_stall_resume_text "$class")
       send_env=(FM_HOME="$FM_HOME")
@@ -527,7 +541,7 @@ stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably workin
       # A delivery that did not land is still a spent attempt, so a wedged
       # endpoint walks the same bounded ladder to escalation instead of being
       # retried on every poll.
-      fm_stall_commit_attempt "$STATE" "$task" "$class" "$detail" "$now" || true
+      fm_stall_commit_attempt "$STATE" "$task" "$class" "$detail" "$now" "$digest" || true
       if [ "$rc" -eq 0 ]; then
         triage_log "auto-resumed $task after a $class stall (attempt $((arg + 1))): $w"
       else
