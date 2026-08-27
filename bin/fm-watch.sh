@@ -489,7 +489,7 @@ stall_declined_marker() {  # <window>
 stall_note_declined() {  # <window> <task> <class> <composer>
   local w=$1 task=$2 class=$3 composer=$4 marker tuple
   marker=$(stall_declined_marker "$w")
-  tuple="$class $composer"
+  tuple="$task $class $composer"
   [ "$(cat "$marker" 2>/dev/null || true)" != "$tuple" ] || return 0
   triage_log "auto-resume declined for $task ($class stall, composer $composer): $w"
   printf '%s\n' "$tuple" > "$marker" 2>/dev/null || true
