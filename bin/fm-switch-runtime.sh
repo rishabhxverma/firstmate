@@ -42,7 +42,9 @@
 #
 # Idempotent in both directions: re-running a converged target changes nothing and
 # exits 0. Exit codes: 0 success; 1 usage error, missing no-mistakes config,
-# missing jq or unparseable opencode.json, declined model-pin offer, or failed write.
+# missing jq, unparseable opencode.json on the switch path, declined model-pin
+# offer, or failed write. --status is read-only: an unparseable opencode.json is
+# reported as "INVALID JSON" alongside the other surfaces rather than aborting.
 set -u
 
 OPENCODE_MODEL="opencode/x-preview-f-free"
@@ -96,11 +98,13 @@ file_mode() {
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || printf '644'
 }
 
-# crew_harness_value: first non-empty, non-comment line of crew-harness, or empty.
+# crew_harness_value: the crew-harness value exactly as its consumer
+# (fm-harness.sh resolve_crew) sees it: the whole file with all whitespace
+# removed, comments included. Anything other than the bare adapter name is
+# therefore drift.
 crew_harness_value() {
   [ -f "$CREW_HARNESS_FILE" ] || return 0
-  grep -vE '^[[:blank:]]*(#|$)' "$CREW_HARNESS_FILE" | head -n 1 |
-    sed -e 's/^[[:blank:]]*//' -e 's/[[:blank:]]*$//'
+  tr -d '[:space:]' < "$CREW_HARNESS_FILE"
 }
 
 # nm_agent_value: trimmed top-level agent value from the no-mistakes config
@@ -124,8 +128,14 @@ require_jq() {
 preflight_opencode_json() {
   [ -f "$OPENCODE_JSON" ] || return 0
   require_jq "read $OPENCODE_JSON"
-  jq empty "$OPENCODE_JSON" >/dev/null 2>&1 ||
+  opencode_json_valid ||
     die "$OPENCODE_JSON is not valid JSON; fix it by hand before switching"
+}
+
+# opencode_json_valid: true when opencode.json is absent or parses as JSON.
+opencode_json_valid() {
+  [ -f "$OPENCODE_JSON" ] || return 0
+  jq empty "$OPENCODE_JSON" >/dev/null 2>&1
 }
 
 # opencode_model_pin: the "model" value from opencode.json, or empty when the
@@ -258,11 +268,16 @@ cmd_switch() {
 }
 
 cmd_status() {
-  local crew nm pin
-  preflight_opencode_json
+  local crew nm pin pin_invalid=0
+  [ -f "$OPENCODE_JSON" ] && require_jq "read $OPENCODE_JSON"
   crew=$(crew_harness_value)
   nm=$(nm_agent_value)
-  pin=$(opencode_model_pin)
+  if opencode_json_valid; then
+    pin=$(opencode_model_pin)
+  else
+    pin_invalid=1
+    pin=""
+  fi
   printf 'runtime switch status\n'
   if [ -n "$crew" ]; then
     printf 'crew harness: %s (%s)\n' "$crew" "$CREW_HARNESS_FILE"
@@ -274,7 +289,9 @@ cmd_status() {
   else
     printf 'pipeline agent: unset (%s)\n' "$NM_CONFIG"
   fi
-  if [ -n "$pin" ]; then
+  if [ "$pin_invalid" -eq 1 ]; then
+    printf 'opencode model pin: INVALID JSON (%s)\n' "$OPENCODE_JSON"
+  elif [ -n "$pin" ]; then
     printf 'opencode model pin: %s (%s)\n' "$pin" "$OPENCODE_JSON"
   else
     printf 'opencode model pin: absent (%s)\n' "$OPENCODE_JSON"
@@ -283,7 +300,10 @@ cmd_status() {
     printf 'note: crew harness and pipeline agent disagree; run bin/fm-switch-runtime.sh <target> to converge\n'
   fi
   if { [ "$crew" = opencode ] || [ "$nm" = opencode ]; } && [ "$pin" != "$OPENCODE_MODEL" ]; then
-    if [ -n "$pin" ]; then
+    if [ "$pin_invalid" -eq 1 ]; then
+      printf "note: %s is not valid JSON; workers will not get oxalpha until it is fixed by hand and pins '%s'\n" \
+        "$OPENCODE_JSON" "$OPENCODE_MODEL"
+    elif [ -n "$pin" ]; then
       printf "note: opencode model pin is '%s', not '%s'; workers will not get oxalpha until %s pins it\n" \
         "$pin" "$OPENCODE_MODEL" "$OPENCODE_JSON"
     else

@@ -249,7 +249,8 @@ It rewrites `config/crew-harness` to the bare adapter name (`opencode` or `claud
 When targeting opencode it first verifies `~/.config/opencode/opencode.json` pins `"model": "opencode/x-preview-f-free"`, because `opencode serve` rejects `-m` and that pin is the only way workers select oxalpha; a missing pin triggers an offer to add it and declining aborts before anything is written.
 Running no-mistakes runs keep their launch-time agent until they finish, and the primary session itself must be relaunched under the other CLI by hand; the script prints both limits on every run.
 `bin/fm-switch-runtime.sh --status` prints the effective runtime per surface: crew harness, pipeline agent, and opencode model pin.
-It prints a note when the crew harness and pipeline agent disagree, and another when either surface is opencode but the model pin is absent or names a different model.
+It prints a note when the crew harness and pipeline agent disagree, and another when either surface is opencode but the model pin is absent, names a different model, or lives in an `opencode.json` that does not parse (shown as `INVALID JSON`).
+The crew harness value is read the same way `fm-harness.sh` reads it, whole file with whitespace stripped, so a commented or multi-line file shows up as drift and is rewritten to the bare token on the next switch.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 

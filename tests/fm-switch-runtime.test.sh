@@ -194,10 +194,15 @@ assert_not_contains "$out" "[y/N]" "invalid opencode.json must not reach the pin
 [ "$(nm_agent)" = "agent: claude" ] || fail "invalid opencode.json must abort before nm write"
 [ -z "$(ls "$T"/opencode.json.tmp.* "$T"/nm.yaml.tmp.* 2>/dev/null)" ] ||
   fail "no temp files may be left behind after a failed switch"
-out=$(switch --status 2>&1)
-code=$?
-expect_code 1 "$code" "--status on invalid opencode.json exits 1"
-assert_contains "$out" "not valid JSON" "--status names the invalid opencode.json"
+out=$(switch --status 2>&1) || fail "--status must still report on invalid opencode.json: $out"
+assert_contains "$out" "crew harness: claude (" "--status prints crew harness despite invalid opencode.json"
+assert_contains "$out" "pipeline agent: claude (" "--status prints pipeline agent despite invalid opencode.json"
+assert_contains "$out" "opencode model pin: INVALID JSON ($OCJSON)" "--status names the invalid opencode.json"
+assert_not_contains "$out" "note:" "claude-converged home with invalid opencode.json prints no drift note"
+nm_fixture opencode
+out=$(switch --status 2>&1) || fail "--status must still report on invalid opencode.json (opencode agent)"
+assert_contains "$out" "opencode model pin: INVALID JSON" "--status keeps naming the invalid file"
+assert_contains "$out" "note: $OCJSON is not valid JSON" "--status flags invalid opencode.json as pin drift for an opencode surface"
 
 # --- missing jq fails fast without leaving temp files ---------------------------
 
@@ -323,6 +328,29 @@ nm_fixture claude
 printf 'claude\n' > "$CREW"
 out=$(switch --status 2>&1)
 assert_not_contains "$out" "note:" "claude-converged home without a pin prints no note"
+
+# Commented or multi-line crew-harness files are drift: the consumer reads the
+# whole file, so --status must report what it sees and switch must rewrite it.
+reset_fixtures
+printf '# pinned by hand\nopencode\n' > "$CREW"
+crew_seen=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-harness.sh" crew 2>/dev/null)
+[ "$crew_seen" != "opencode" ] || fail "fixture must be something the consumer cannot resolve"
+out=$(switch --status 2>&1)
+assert_contains "$out" "crew harness: $crew_seen (" "status reports the consumer-visible value of a commented crew-harness"
+assert_contains "$out" "disagree" "commented crew-harness is reported as drift"
+out=$(switch opencode 2>&1) || fail "switch on commented crew-harness should succeed: $out"
+assert_contains "$out" "crew harness: updated" "switch rewrites a commented crew-harness instead of reporting unchanged"
+[ "$(crew_line)" = "opencode" ] || fail "commented crew-harness must be rewritten to the bare token, got: $(crew_line)"
+[ "$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-harness.sh" crew 2>/dev/null)" = "opencode" ] ||
+  fail "consumer must resolve the rewritten crew-harness cleanly"
+
+printf 'opencode\nfoo\n' > "$CREW"
+out=$(switch --status 2>&1)
+assert_contains "$out" "crew harness: opencodefoo (" "status reports a multi-line crew-harness as the consumer sees it"
+assert_contains "$out" "disagree" "multi-line crew-harness is reported as drift"
+out=$(switch opencode 2>&1) || fail "switch on multi-line crew-harness should succeed: $out"
+assert_contains "$out" "crew harness: updated" "switch rewrites a multi-line crew-harness"
+[ "$(crew_line)" = "opencode" ] || fail "multi-line crew-harness must collapse to the bare token, got: $(crew_line)"
 
 # Whitespace around the crew-harness token is ignored, matching resolve_crew.
 reset_fixtures
