@@ -10,17 +10,21 @@
 #   bin/fm-switch-runtime.sh --help              this help
 #
 # Surfaces switched:
-#   1. <FM_HOME>/config/crew-harness       rewritten to one line: the target harness,
-#                                          plus " opencode/x-preview-f-free" when the
-#                                          target is opencode ("claude" alone otherwise).
-#   2. ~/.no-mistakes/config.yaml          the top-level "agent:" key flipped between
-#                                          opencode and claude; every other line,
-#                                          including surrounding comments, preserved.
+#   1. <FM_HOME>/config/crew-harness       rewritten to one line holding the bare
+#                                          adapter name ("opencode" or "claude"); the
+#                                          consumer (fm-harness.sh resolve_crew) never
+#                                          parses a model from this file.
+#   2. ~/.no-mistakes/config.yaml          only the value token of the top-level
+#                                          "agent:" key flipped between opencode and
+#                                          claude; every other line, the surrounding
+#                                          comments, and any inline comment on the
+#                                          agent line itself are preserved.
 #   3. ~/.config/opencode/opencode.json    checked ONLY when targeting opencode: the
 #                                          "model" key must equal
 #                                          opencode/x-preview-f-free, because
 #                                          `opencode serve` rejects -m and this pin is
-#                                          the only way workers get oxalpha. Missing pin
+#                                          the only way workers get oxalpha, and the
+#                                          only place the model is pinned. Missing pin
 #                                          triggers an offer to add it; declining aborts
 #                                          before any surface is touched. A present pin
 #                                          naming a different model is kept and warned
@@ -38,7 +42,7 @@
 #
 # Idempotent in both directions: re-running a converged target changes nothing and
 # exits 0. Exit codes: 0 success; 1 usage error, missing no-mistakes config,
-# declined model-pin offer, or failed write.
+# missing jq or unparseable opencode.json, declined model-pin offer, or failed write.
 set -u
 
 OPENCODE_MODEL="opencode/x-preview-f-free"
@@ -49,6 +53,13 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 CREW_HARNESS_FILE="${FM_HOME}/config/crew-harness"
 NM_CONFIG="${FM_SWITCH_NM_CONFIG:-${HOME}/.no-mistakes/config.yaml}"
 OPENCODE_JSON="${FM_SWITCH_OPENCODE_JSON:-${HOME}/.config/opencode/opencode.json}"
+
+TMP_FILE=""
+cleanup_tmp() {
+  [ -n "$TMP_FILE" ] && rm -f "$TMP_FILE"
+  return 0
+}
+trap cleanup_tmp EXIT
 
 die() {
   printf 'fm-switch-runtime: %s\n' "$1" >&2
@@ -91,19 +102,35 @@ crew_harness_value() {
   grep -vE '^[[:blank:]]*(#|$)' "$CREW_HARNESS_FILE" | head -n 1
 }
 
-# nm_agent_value: trimmed top-level agent value from the no-mistakes config, or empty.
+# nm_agent_value: trimmed top-level agent value from the no-mistakes config
+# (inline comment and surrounding quotes stripped), or empty.
 nm_agent_value() {
   [ -f "$NM_CONFIG" ] || return 0
   grep -E '^agent:' "$NM_CONFIG" | head -n 1 |
-    sed -e 's/^agent:[[:blank:]]*//' -e 's/[[:blank:]]*$//' -e 's/^"//' -e 's/"$//'
+    sed -e 's/^agent:[[:blank:]]*//' -e 's/[[:blank:]]*#.*$//' \
+      -e 's/[[:blank:]]*$//' -e 's/^"//' -e 's/"$//'
+}
+
+# require_jq <why>: die unless jq is on PATH. Called from the main process, never
+# from inside a command substitution, so the die really exits.
+require_jq() {
+  command -v jq >/dev/null 2>&1 ||
+    die "jq is required to $1 but was not found on PATH"
+}
+
+# preflight_opencode_json: when opencode.json exists, require jq and refuse to
+# proceed if the file does not parse. Runs before any prompt or write.
+preflight_opencode_json() {
+  [ -f "$OPENCODE_JSON" ] || return 0
+  require_jq "read $OPENCODE_JSON"
+  jq empty "$OPENCODE_JSON" >/dev/null 2>&1 ||
+    die "$OPENCODE_JSON is not valid JSON; fix it by hand before switching"
 }
 
 # opencode_model_pin: the "model" value from opencode.json, or empty when the
-# file is absent. Requires jq whenever the file exists.
+# file is absent. Callers run preflight_opencode_json first.
 opencode_model_pin() {
   [ -f "$OPENCODE_JSON" ] || return 0
-  command -v jq >/dev/null 2>&1 ||
-    die "jq is required to read $OPENCODE_JSON but was not found on PATH"
   jq -r '.model // ""' "$OPENCODE_JSON"
 }
 
@@ -113,17 +140,14 @@ write_file_preserving_mode() {
   local src=$1 dst=$2 mode
   mode=$(file_mode "$dst")
   mv "$src" "$dst" || die "failed to replace $dst"
+  TMP_FILE=""
   chmod "$mode" "$dst" || die "failed to restore permissions on $dst"
 }
 
-# set_crew_harness <target>: rewrite crew-harness to its single canonical line.
+# set_crew_harness <target>: rewrite crew-harness to the bare adapter name.
 set_crew_harness() {
   local target=$1 desired
-  if [ "$target" = opencode ]; then
-    desired="opencode ${OPENCODE_MODEL}"
-  else
-    desired="claude"
-  fi
+  desired="$target"
   mkdir -p "$(dirname "$CREW_HARNESS_FILE")" ||
     die "cannot create $(dirname "$CREW_HARNESS_FILE")"
   if [ "$(crew_harness_value)" = "$desired" ]; then
@@ -136,15 +160,17 @@ set_crew_harness() {
 }
 
 # set_nm_agent <target>: flip the top-level agent key in place, preserving every
-# other line. Replaces existing key lines; inserts the key before the first
-# non-comment line when absent.
+# other line. Replaces only the value token of existing key lines, so a trailing
+# inline comment survives; inserts the key before the first non-comment line
+# when absent.
 set_nm_agent() {
   local target=$1 tmp count
   count=$(grep -cE '^agent:' "$NM_CONFIG" || true)
   tmp=$(mktemp "${NM_CONFIG}.tmp.XXXXXX") ||
     die "cannot create temp file next to $NM_CONFIG"
+  TMP_FILE="$tmp"
   if [ "${count:-0}" -gt 0 ]; then
-    sed "s/^agent:.*/agent: ${target}/" "$NM_CONFIG" > "$tmp"
+    sed "s/^\(agent:[[:blank:]]*\)[^#[:blank:]]*/\1${target}/" "$NM_CONFIG" > "$tmp"
   else
     awk -v ins="agent: ${target}" '
       !done && $0 !~ /^[[:blank:]]*$/ && $0 !~ /^#/ { print ins; done = 1 }
@@ -152,7 +178,7 @@ set_nm_agent() {
       END { if (!done) print ins }
     ' "$NM_CONFIG" > "$tmp"
   fi
-  grep -qE "^agent:[[:blank:]]*${target}[[:blank:]]*\$" "$tmp" ||
+  grep -qE "^agent:[[:blank:]]*${target}([[:blank:]]|\$)" "$tmp" ||
     die "rewrite of $NM_CONFIG did not produce 'agent: ${target}'"
   write_file_preserving_mode "$tmp" "$NM_CONFIG"
   printf "no-mistakes agent: set -> '%s' (%s)\n" "$target" "$NM_CONFIG"
@@ -163,6 +189,8 @@ set_nm_agent() {
 # warning when a deliberate non-oxalpha pin was left in place.
 ensure_opencode_pin() {
   local pin answer tmp
+  require_jq "read or write $OPENCODE_JSON"
+  preflight_opencode_json
   pin=$(opencode_model_pin)
   if [ "$pin" = "$OPENCODE_MODEL" ]; then
     printf "opencode model pin: ok ('%s' in %s)\n" "$pin" "$OPENCODE_JSON"
@@ -190,10 +218,9 @@ ensure_opencode_pin() {
   esac
   mkdir -p "$(dirname "$OPENCODE_JSON")" ||
     die "cannot create $(dirname "$OPENCODE_JSON")"
-  command -v jq >/dev/null 2>&1 ||
-    die "jq is required to write $OPENCODE_JSON but was not found on PATH"
   tmp=$(mktemp "${OPENCODE_JSON}.tmp.XXXXXX") ||
     die "cannot create temp file next to $OPENCODE_JSON"
+  TMP_FILE="$tmp"
   if [ -f "$OPENCODE_JSON" ]; then
     jq --arg m "$OPENCODE_MODEL" '.model = $m' "$OPENCODE_JSON" > "$tmp" ||
       die "failed to update model pin in $OPENCODE_JSON (invalid JSON?)"
@@ -230,6 +257,7 @@ cmd_switch() {
 
 cmd_status() {
   local crew nm pin
+  preflight_opencode_json
   crew=$(crew_harness_value)
   nm=$(nm_agent_value)
   pin=$(opencode_model_pin)
@@ -249,8 +277,17 @@ cmd_status() {
   else
     printf 'opencode model pin: absent (%s)\n' "$OPENCODE_JSON"
   fi
-  if [ -n "$crew" ] && [ -n "$nm" ] && [ "${crew%%[[:blank:]]*}" != "$nm" ]; then
+  if [ -n "$crew" ] && [ -n "$nm" ] && [ "$crew" != "$nm" ]; then
     printf 'note: crew harness and pipeline agent disagree; run bin/fm-switch-runtime.sh <target> to converge\n'
+  fi
+  if { [ "$crew" = opencode ] || [ "$nm" = opencode ]; } && [ "$pin" != "$OPENCODE_MODEL" ]; then
+    if [ -n "$pin" ]; then
+      printf "note: opencode model pin is '%s', not '%s'; workers will not get oxalpha until %s pins it\n" \
+        "$pin" "$OPENCODE_MODEL" "$OPENCODE_JSON"
+    else
+      printf "note: opencode model pin is absent; workers will not get oxalpha until %s pins '%s' (run bin/fm-switch-runtime.sh opencode)\n" \
+        "$OPENCODE_JSON" "$OPENCODE_MODEL"
+    fi
   fi
 }
 

@@ -245,10 +245,11 @@ For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected exec
 ## Runtime switch (bin/fm-switch-runtime.sh)
 
 `bin/fm-switch-runtime.sh <opencode|claude>` flips the local fleet runtime between the opencode+oxalpha pairing and Claude in one command, replacing a three-file hand edit.
-It rewrites `config/crew-harness` and flips the top-level `agent:` key in `~/.no-mistakes/config.yaml`, preserving every surrounding comment, and is idempotent in both directions.
+It rewrites `config/crew-harness` to the bare adapter name (`opencode` or `claude`, never a model token) and replaces only the value of the top-level `agent:` key in `~/.no-mistakes/config.yaml`, preserving every surrounding comment and any inline comment on that line, and is idempotent in both directions.
 When targeting opencode it first verifies `~/.config/opencode/opencode.json` pins `"model": "opencode/x-preview-f-free"`, because `opencode serve` rejects `-m` and that pin is the only way workers select oxalpha; a missing pin triggers an offer to add it and declining aborts before anything is written.
 Running no-mistakes runs keep their launch-time agent until they finish, and the primary session itself must be relaunched under the other CLI by hand; the script prints both limits on every run.
 `bin/fm-switch-runtime.sh --status` prints the effective runtime per surface: crew harness, pipeline agent, and opencode model pin.
+It prints a note when the crew harness and pipeline agent disagree, and another when either surface is opencode but the model pin is absent or names a different model.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 

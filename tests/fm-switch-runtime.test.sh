@@ -62,7 +62,7 @@ reset_fixtures() {
   mkdir -p "$HOME_DIR/config"
   nm_fixture opencode
   oc_fixture opencode/x-preview-f-free
-  printf 'opencode opencode/x-preview-f-free\n' > "$CREW"
+  printf 'opencode\n' > "$CREW"
 }
 
 switch() {
@@ -98,7 +98,6 @@ expect_code 1 "$code" "--status with extra arg exits 1"
 
 reset_fixtures
 out=$(switch claude 2>&1) || fail "claude switch should succeed: $out"
-expect_code 0 $? "claude switch exit code"
 assert_contains "$out" "NOT switched automatically" "claude switch prints limits"
 assert_contains "$out" "relaunch the primary session" "claude switch names relaunch duty"
 [ "$(crew_line)" = "claude" ] || fail "crew-harness should be 'claude', got: $(crew_line)"
@@ -124,9 +123,11 @@ assert_contains "$out" "unchanged" "idempotent claude re-run reports unchanged c
 
 oc_fixture opencode/x-preview-f-free
 out=$(switch opencode 2>&1) || fail "opencode switch should succeed: $out"
-expect_code 0 $? "opencode switch exit code"
-[ "$(crew_line)" = "opencode opencode/x-preview-f-free" ] ||
-  fail "crew-harness should carry oxalpha model, got: $(crew_line)"
+[ "$(crew_line)" = "opencode" ] ||
+  fail "crew-harness should be the bare adapter name, got: $(crew_line)"
+crew_resolved=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-harness.sh" crew 2>/dev/null)
+[ "$crew_resolved" = "opencode" ] ||
+  fail "fm-harness.sh resolve_crew must accept the written crew-harness, got: $crew_resolved"
 [ "$(nm_agent)" = "agent: opencode" ] || fail "agent key should be opencode, got: $(nm_agent)"
 assert_contains "$out" "model pin: ok" "satisfied pin reported ok"
 
@@ -161,18 +162,63 @@ assert_grep 'aws-mcp' "$OCJSON" "mcp block survives pin addition"
 # --- model pin offer: declined aborts before any write ------------------------
 
 reset_fixtures
+nm_fixture claude
+printf 'claude\n' > "$CREW"
 oc_fixture missing
-before_crew=$(cat "$CREW")
 out=$(printf 'n\n' | switch opencode 2>&1)
 code=$?
 expect_code 1 "$code" "declined pin offer exits non-zero"
 assert_contains "$out" "aborted without changing anything" "decline message explains no writes"
-[ "$(cat "$CREW")" = "$before_crew" ] || fail "declined offer must not touch crew-harness"
-[ "$(nm_agent)" = "agent: opencode" ] || fail "declined offer must not touch nm config"
+[ "$(crew_line)" = "claude" ] || fail "declined offer must not touch crew-harness, got: $(crew_line)"
+[ "$(nm_agent)" = "agent: claude" ] || fail "declined offer must not touch nm config, got: $(nm_agent)"
 out=$(switch opencode </dev/null 2>&1)
 code=$?
 expect_code 1 "$code" "EOF at prompt counts as decline"
 assert_absent "$OCJSON" "declined offer must not create opencode.json"
+[ "$(crew_line)" = "claude" ] || fail "EOF decline must not touch crew-harness"
+[ "$(nm_agent)" = "agent: claude" ] || fail "EOF decline must not touch nm config"
+
+# --- malformed opencode.json fails fast before any prompt or write -------------
+
+reset_fixtures
+nm_fixture claude
+printf 'claude\n' > "$CREW"
+printf '{ bad json\n' > "$OCJSON"
+out=$(printf 'y\n' | switch opencode 2>&1)
+code=$?
+expect_code 1 "$code" "invalid opencode.json exits 1"
+assert_contains "$out" "not valid JSON" "invalid opencode.json error names the problem"
+assert_not_contains "$out" "[y/N]" "invalid opencode.json must not reach the pin offer"
+[ "$(cat "$OCJSON")" = "{ bad json" ] || fail "invalid opencode.json must be left untouched"
+[ "$(crew_line)" = "claude" ] || fail "invalid opencode.json must abort before crew-harness write"
+[ "$(nm_agent)" = "agent: claude" ] || fail "invalid opencode.json must abort before nm write"
+[ -z "$(ls "$T"/opencode.json.tmp.* "$T"/nm.yaml.tmp.* 2>/dev/null)" ] ||
+  fail "no temp files may be left behind after a failed switch"
+out=$(switch --status 2>&1)
+code=$?
+expect_code 1 "$code" "--status on invalid opencode.json exits 1"
+assert_contains "$out" "not valid JSON" "--status names the invalid opencode.json"
+
+# --- missing jq fails fast without leaving temp files ---------------------------
+
+reset_fixtures
+nm_fixture claude
+printf 'claude\n' > "$CREW"
+oc_fixture missing
+nojq=$(fm_test_tmproot switch-runtime-nojq)/bin
+mkdir -p "$nojq"
+for tool in bash sh grep sed awk head cat mktemp mv chmod stat dirname mkdir tr ls; do
+  real=$(command -v "$tool") && ln -sf "$real" "$nojq/$tool"
+done
+out=$(printf 'y\n' | PATH="$nojq" switch opencode 2>&1)
+code=$?
+expect_code 1 "$code" "missing jq exits 1"
+assert_contains "$out" "jq is required" "missing jq error names jq"
+assert_not_contains "$out" "[y/N]" "missing jq must not reach the pin offer"
+assert_absent "$OCJSON" "missing jq must not create opencode.json"
+[ "$(crew_line)" = "claude" ] || fail "missing jq must abort before crew-harness write"
+[ -z "$(ls "$T"/opencode.json.tmp.* "$T"/nm.yaml.tmp.* 2>/dev/null)" ] ||
+  fail "no temp files may be left behind when jq is missing"
 
 # --- different existing pin is kept and warned -------------------------------
 
@@ -190,7 +236,7 @@ out=$(switch claude 2>&1)
 code=$?
 expect_code 1 "$code" "missing nm config exits 1"
 assert_contains "$out" "required file not found" "missing config error names the file"
-[ "$(crew_line)" = "opencode opencode/x-preview-f-free" ] ||
+[ "$(crew_line)" = "opencode" ] ||
   fail "failed preflight must not have touched crew-harness"
 
 # --- agent key absent gets inserted top-level ---------------------------------
@@ -203,20 +249,64 @@ first_non_comment=$(grep -vE '^[[:blank:]]*(#|$)' "$NM" | head -n 1)
 [ "$first_non_comment" = "agent: claude" ] ||
   fail "inserted key must precede other top-level keys, got: $first_non_comment"
 
+# --- inline comment on the agent line survives --------------------------------
+
+reset_fixtures
+nm_fixture 'claude # why'
+switch opencode >/dev/null 2>&1 || fail "switch with inline comment should succeed"
+[ "$(nm_agent)" = "agent: opencode # why" ] ||
+  fail "inline comment on agent line must survive, got: $(nm_agent)"
+before_nm=$(cat "$NM")
+out=$(switch opencode 2>&1) || fail "converged run on commented agent line should succeed"
+[ "$(cat "$NM")" = "$before_nm" ] ||
+  fail "converged run on commented agent line must be byte-identical"
+switch claude >/dev/null 2>&1 || fail "switch back with inline comment should succeed"
+[ "$(nm_agent)" = "agent: claude # why" ] ||
+  fail "inline comment must survive the reverse direction, got: $(nm_agent)"
+out=$(switch --status 2>&1)
+assert_contains "$out" "pipeline agent: claude (" "status strips the inline comment from the agent value"
+
+nm_fixture '"claude"'
+switch opencode >/dev/null 2>&1 || fail "switch with quoted agent value should succeed"
+[ "$(nm_agent)" = "agent: opencode" ] || fail "quoted value normalizes to bare, got: $(nm_agent)"
+
 # --- status -------------------------------------------------------------------
 
 reset_fixtures
 out=$(switch --status 2>&1)
-assert_contains "$out" "crew harness: opencode opencode/x-preview-f-free" "status shows crew harness"
+assert_contains "$out" "crew harness: opencode (" "status shows crew harness"
 assert_contains "$out" "pipeline agent: opencode" "status shows pipeline agent"
 assert_contains "$out" "opencode model pin: opencode/x-preview-f-free" "status shows model pin"
 assert_not_contains "$out" "disagree" "converged surfaces report no disagreement"
+assert_not_contains "$out" "note:" "converged surfaces print no note"
 
 # Drifted surfaces get flagged.
 nm_fixture claude
 out=$(switch --status 2>&1)
 assert_contains "$out" "pipeline agent: claude" "status reflects drifted pipeline agent"
 assert_contains "$out" "disagree" "status flags drifted surfaces"
+
+# A wrong or absent model pin is drift too when either surface is opencode.
+reset_fixtures
+oc_fixture opencode/some-paid-model
+out=$(switch --status 2>&1)
+assert_contains "$out" "opencode model pin: opencode/some-paid-model" "status shows the drifted pin"
+assert_contains "$out" "note: opencode model pin is 'opencode/some-paid-model'" "status flags a wrong model pin"
+assert_not_contains "$out" "disagree" "wrong pin alone is not a crew-vs-agent disagreement"
+
+oc_fixture none
+out=$(switch --status 2>&1)
+assert_contains "$out" "note: opencode model pin is absent" "status flags a missing model key"
+
+oc_fixture missing
+out=$(switch --status 2>&1)
+assert_contains "$out" "opencode model pin: absent" "status reports absent opencode.json"
+assert_contains "$out" "note: opencode model pin is absent" "status flags an absent opencode.json"
+
+nm_fixture claude
+printf 'claude\n' > "$CREW"
+out=$(switch --status 2>&1)
+assert_not_contains "$out" "note:" "claude-converged home without a pin prints no note"
 
 # Absent surfaces are named, not silently blank.
 rm -f "$OCJSON" "$CREW"
