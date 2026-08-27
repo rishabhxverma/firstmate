@@ -270,6 +270,22 @@ nm_fixture '"claude"'
 switch opencode >/dev/null 2>&1 || fail "switch with quoted agent value should succeed"
 [ "$(nm_agent)" = "agent: opencode" ] || fail "quoted value normalizes to bare, got: $(nm_agent)"
 
+# --- empty agent value gets a well-formed separator ----------------------------
+
+nm_fixture ''
+switch opencode >/dev/null 2>&1 || fail "switch from empty agent value should succeed"
+[ "$(nm_agent)" = "agent: opencode" ] || fail "empty value must become 'agent: opencode', got: $(nm_agent)"
+
+nm_fixture '# c'
+switch opencode >/dev/null 2>&1 || fail "switch from comment-only agent value should succeed"
+[ "$(nm_agent)" = "agent: opencode # c" ] ||
+  fail "comment-only value must become 'agent: opencode # c', got: $(nm_agent)"
+
+nm_fixture '   claude   # c'
+switch opencode >/dev/null 2>&1 || fail "switch from padded agent value should succeed"
+[ "$(nm_agent)" = "agent: opencode   # c" ] ||
+  fail "padded value normalizes the separator and keeps the comment, got: $(nm_agent)"
+
 # --- status -------------------------------------------------------------------
 
 reset_fixtures
@@ -307,6 +323,16 @@ nm_fixture claude
 printf 'claude\n' > "$CREW"
 out=$(switch --status 2>&1)
 assert_not_contains "$out" "note:" "claude-converged home without a pin prints no note"
+
+# Whitespace around the crew-harness token is ignored, matching resolve_crew.
+reset_fixtures
+printf '  opencode \n' > "$CREW"
+out=$(switch --status 2>&1)
+assert_contains "$out" "crew harness: opencode (" "status trims whitespace around the crew token"
+assert_not_contains "$out" "note:" "padded crew token on a converged home prints no note"
+oc_fixture none
+out=$(switch --status 2>&1)
+assert_contains "$out" "note: opencode model pin is absent" "padded crew token still drives the pin drift check"
 
 # Absent surfaces are named, not silently blank.
 rm -f "$OCJSON" "$CREW"

@@ -99,7 +99,8 @@ file_mode() {
 # crew_harness_value: first non-empty, non-comment line of crew-harness, or empty.
 crew_harness_value() {
   [ -f "$CREW_HARNESS_FILE" ] || return 0
-  grep -vE '^[[:blank:]]*(#|$)' "$CREW_HARNESS_FILE" | head -n 1
+  grep -vE '^[[:blank:]]*(#|$)' "$CREW_HARNESS_FILE" | head -n 1 |
+    sed -e 's/^[[:blank:]]*//' -e 's/[[:blank:]]*$//'
 }
 
 # nm_agent_value: trimmed top-level agent value from the no-mistakes config
@@ -170,7 +171,8 @@ set_nm_agent() {
     die "cannot create temp file next to $NM_CONFIG"
   TMP_FILE="$tmp"
   if [ "${count:-0}" -gt 0 ]; then
-    sed "s/^\(agent:[[:blank:]]*\)[^#[:blank:]]*/\1${target}/" "$NM_CONFIG" > "$tmp"
+    sed -e "s/^agent:[[:blank:]]*[^#[:blank:]]*/agent: ${target}/" \
+      -e "s/^agent: ${target}#/agent: ${target} #/" "$NM_CONFIG" > "$tmp"
   else
     awk -v ins="agent: ${target}" '
       !done && $0 !~ /^[[:blank:]]*$/ && $0 !~ /^#/ { print ins; done = 1 }
