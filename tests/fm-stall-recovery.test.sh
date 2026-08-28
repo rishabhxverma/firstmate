@@ -489,8 +489,8 @@ test_a_class_change_keeps_the_ladder_position() {
 test_an_unchanged_pane_refuses_a_due_resume() {
   local d id n dg dg2
   d="$TMP_ROOT/episode-unchanged/state"; mkdir -p "$d"; id=task; n=1000000
-  dg=$(printf 'pane bytes\n' | md5 -q)
-  dg2=$(printf 'different pane bytes\n' | md5 -q)
+  dg=$(fm_stall_pane_digest "pane bytes")
+  dg2=$(fm_stall_pane_digest "different pane bytes")
   [ "$dg" != "$dg2" ] || fail "digest fixtures collided"
   [ "$(fm_stall_plan "$d" "$id" overload 529 "$n")" = "armed 120" ] \
     || fail "the episode did not arm"
