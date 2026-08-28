@@ -176,6 +176,34 @@ tests/fm-busy-adapter-wiring.test.sh
 tests/fm-crew-state.test.sh
 ```
 
+## Claude stall auto-resume
+
+[`bin/fm-stall-lib.sh`](../../bin/fm-stall-lib.sh) resumes a Claude worker whose usage-limit window has closed, or whose turn ended on a transient upstream 5xx, without waking a human.
+Three inputs must agree before it acts.
+Two are structural and rest on evidence recorded elsewhere; the third is rendered banner text, and this section records exactly how far that one is verified.
+
+| Input | Status on 2026-08-24 | Evidence |
+| --- | --- | --- |
+| The worker is not provably working | Verified | "Semantic busy state" above. Claude's `StopFailure` and `Stop` hooks are wired from the four hook names present in the installed binary, and an API-error turn end writes `idle source=claude-hook`. |
+| The composer is provably empty | Verified for the composer contract, not re-run here | [`runtime-backends.md`](runtime-backends.md) records that Claude renders a bare `❯` agent composer, that a bare shell glyph is never treated as one, and that only a proven-empty composer is a safe injection target; its live Claude composer confirmation is dated against Claude Code 2.1.226. The version installed on this host on 2026-08-24 is `2.1.241 (Claude Code)`, read with `claude --version`. |
+| The rendered banner names which stall this is | Not live-reproducible | Neither an upstream 529 nor a usage-limit window can be induced against a live account on demand, so no live guard can assert this text. The recognised phrasings are the vendor's own rendered forms as collected by the prior art vetted for this change (`terryso/claude-auto-resume`, `carlaost/resume-after-limit`), plus two forms observed directly in this fleet on 2026-08-24: the `529`/`overloaded_error` turn end, and `You've hit your session limit · resets 4:40pm (America/Mexico_City)`, read off a real Claude Code worker. That second observation also produced the bound in `FM_STALL_MAX_RESET_WAIT`: it was read at 4:43pm, three minutes after its own reset, where an unbounded rollover would have scheduled a 24-hour wait. |
+
+The unverifiable input is deliberately the least load-bearing of the three, which is why the ordering in `bin/fm-watch.sh`'s `stall_autoresume_step` is a safety property rather than an implementation detail.
+Banner text can never cause a resume on its own: both structural gates must already have passed, so a pane mid-turn, a pane holding a genuine question or permission dialog, and a pane with text somebody already typed are each excluded before any text is read.
+Each stall class also carries several independent phrasings rather than one vendor string, so a single rendering change cannot silently disable the path.
+An unrecognised banner classifies as no stall at all, and the pane then follows exactly the pre-existing stale path, so a rendering drift degrades to the manual recovery every home had before this change rather than to a wrong action.
+
+Position is part of that verification as well: the banner must hug the composer, and the regression pins both directions - a banner separated from the composer by the worker's own output classifies as no stall, while a banner with only blank rows, box borders, and composer rendering between it and the composer still fires.
+One wrapped row is allowed for the JSON-bearing upstream error form, gated on the upper row ending in a payload-punctuation artifact, so a finished line of output above a stale banner cannot masquerade as a wrapped banner.
+
+Refresh the third row after any Claude Code upgrade that changes how a limit or API-error turn end is rendered: capture the pane text from the affected worker, add the new phrasing to the banner families in `bin/fm-stall-lib.sh`, and pin it in the regression below.
+
+Deterministic entry point:
+
+```sh
+tests/fm-stall-recovery.test.sh
+```
+
 ## Turn-end guard
 
 The direct and passive mechanisms were validated across all five harnesses on 2026-07-08 through 2026-07-12, with Claude's replacement Stop-owned path revalidated on 2026-07-24.
