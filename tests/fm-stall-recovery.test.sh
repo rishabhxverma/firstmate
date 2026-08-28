@@ -852,6 +852,33 @@ test_a_pane_with_text_already_in_its_composer_is_never_resumed() {
   pass "a pane with text already in its composer is never auto-resumed, and the decline is logged once per transition"
 }
 
+test_a_reused_window_logs_a_fresh_decline_for_its_new_task() {
+  local dir state window pane out cy
+  dir=$(make_stall_case reused-window); state="$dir/state"
+  window="test:fm-reused"; pane="$dir/pane.txt"; out="$dir/watch.out"
+  cy=$(write_pane "$pane" boxed "please rerun the failing case" \
+    '  ⎿  API Error: 529 overloaded_error')
+  arm_claude_task "$state" firsttask "$window" idle stop-failure
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  local pid=$!
+  wait_for_grep 'auto-resume declined for firsttask' "$state/.watch-triage.log" 300 \
+    || { reap "$pid"; fail "the first task's decline was never logged: $(cat "$state/.watch-triage.log" 2>/dev/null)"; }
+  wait "$pid" 2>/dev/null || true
+  # The window is torn down and reassigned to a new task, same class and
+  # composer state (the marker file at .stall-declined-<key> is keyed on the
+  # window, not the task, so it survives the reassignment). A stale marker that
+  # ignored the task would wrongly suppress the new task's first decline.
+  rm -f "$state/firsttask.meta"
+  arm_claude_task "$state" secondtask "$window" idle stop-failure
+  stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
+  pid=$!
+  wait_for_grep 'auto-resume declined for secondtask' "$state/.watch-triage.log" 300 \
+    || { reap "$pid"; fail "a window reused by a new task suppressed that task's first decline: $(cat "$state/.watch-triage.log")"; }
+  [ ! -s "$dir/sent.log" ] || { reap "$pid"; fail "a pane with text already typed was auto-resumed"; }
+  reap "$pid"
+  pass "a window reused by a new task logs a fresh decline instead of inheriting the old task's suppression"
+}
+
 test_a_recovered_workers_stale_banner_is_never_retriggered() {
   local dir state window pane out cy
   dir=$(make_stall_case buried-banner); state="$dir/state"
@@ -949,6 +976,7 @@ test_a_usage_limit_pane_waits_for_its_reset_instead_of_resuming
 test_a_spent_ladder_surfaces_one_stale_wake_carrying_its_history
 test_a_working_pane_is_never_resumed
 test_a_pane_with_text_already_in_its_composer_is_never_resumed
+test_a_reused_window_logs_a_fresh_decline_for_its_new_task
 test_a_recovered_workers_stale_banner_is_never_retriggered
 test_a_pane_unchanged_since_the_last_delivery_is_not_nudged_again
 test_a_non_claude_pane_is_never_resumed
