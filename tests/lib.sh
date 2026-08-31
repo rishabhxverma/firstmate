@@ -71,6 +71,24 @@ pass() {
 FM_TEST_CLEANUP_DIRS=()
 FM_TEST_CLEANUP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/.fm-test-cleanup.$$.XXXXXX") || return 1
 
+# fm_test_register_pid <pid> records a backgrounded process so fm_test_cleanup
+# kills it on EXIT/INT/TERM even when a `fail` (hard `exit 1`) skips the
+# call site's own kill/wait pair. A leaked backgrounded process is not just
+# untidy: piped through fm-test-run.sh's `bash "$script" | tee out`, an
+# orphan that inherited the pipe's write end keeps tee blocked - and the
+# whole job looking hung - until that orphan exits on its own. Written to a
+# registry FILE, not an array, for the same reason fm_test_tmproot registers
+# temp roots that way (see its comment below): a call from inside a
+# command-substitution subshell must still reach the real caller's cleanup.
+# Safe to call for a pid that also gets an explicit kill/wait later: killing
+# an already-reaped pid here is a silent no-op.
+FM_TEST_PID_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/.fm-test-pids.$$.XXXXXX") || return 1
+
+fm_test_register_pid() {
+  [ -n "${1:-}" ] || return 0
+  printf '%s\n' "$1" >> "$FM_TEST_PID_REGISTRY"
+}
+
 fm_test_pid_identity() {
   local pid=$1
   FM_STATE_OVERRIDE="${TMPDIR:-/tmp}" bash -c \
@@ -78,12 +96,32 @@ fm_test_pid_identity() {
 }
 
 FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
-  rm -f "$FM_TEST_CLEANUP_REGISTRY"
+  rm -f "$FM_TEST_CLEANUP_REGISTRY" "$FM_TEST_PID_REGISTRY"
   return 1
 }
 
 fm_test_cleanup() {
-  local d
+  local d pid still_alive
+  if [ -f "$FM_TEST_PID_REGISTRY" ]; then
+    while IFS= read -r pid; do
+      [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
+    done < "$FM_TEST_PID_REGISTRY"
+    # Bounded grace (~200ms) so a trapped TERM can finish before KILL - long
+    # enough for the fixtures in this suite, short enough this never hangs
+    # the exit path that a leaked process was itself supposed to avoid.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      still_alive=0
+      while IFS= read -r pid; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && still_alive=1
+      done < "$FM_TEST_PID_REGISTRY"
+      [ "$still_alive" -eq 1 ] || break
+      sleep 0.02
+    done
+    while IFS= read -r pid; do
+      [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null
+    done < "$FM_TEST_PID_REGISTRY"
+    rm -f "$FM_TEST_PID_REGISTRY"
+  fi
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
