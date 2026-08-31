@@ -53,6 +53,15 @@
 #                          running a check or removing poll artifacts
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
+# Claude stall auto-resume (default on, config/auto-resume=off disables; see
+# bin/fm-stall-lib.sh) sits AHEAD of stale classification. A claude crewmate or
+# scout that is not provably working, whose composer is provably empty, and whose
+# pane tail shows a usage-limit or upstream-5xx banner is absorbed and resumed on
+# a bounded ladder instead of surfacing: a worker waiting out its own limit
+# window is not a wedge. Routine resumes are triage-log only. Once the ladder is
+# spent the episode surfaces exactly once, through the ordinary "stale: ..."
+# reason above, carrying the spent-attempt count so the supervisor inspects
+# rather than resuming again.
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -82,6 +91,15 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# Claude stall auto-resume: bin/fm-stall-lib.sh owns detection, the reset-time
+# parse, the bounded backoff ladder, and the per-task episode record; the wiring
+# below owns only the gate, the send, the log line, and the escalation. The
+# resume steer is a normal fm-send delivery, bounded through the single owner of
+# bounded execution so a wedged endpoint can never stall a poll cycle.
+# shellcheck source=bin/fm-stall-lib.sh
+. "$SCRIPT_DIR/fm-stall-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -113,6 +131,9 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"   # home-local operating choices; config/auto-resume gates the stall path
+FM_STALL_SEND_BIN="${FM_STALL_SEND_BIN:-$SCRIPT_DIR/fm-send.sh}"  # steer transport for an auto-resume; tests stub it
+STALL_SEND_TIMEOUT=${FM_STALL_SEND_TIMEOUT:-45}   # hard bound on one auto-resume delivery
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -411,10 +432,15 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
-surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last
+# <reason> defaults to the bare "stale: <window>" payload. A caller that already
+# knows WHY this pane is being surfaced - the auto-resume ladder below is the
+# only one today - passes a fuller reason so the wake itself carries that
+# history instead of the supervisor having to rediscover it.
+surface_nonterminal_stale() {  # <window> <hash> [reason]
+  local win=$1 h=$2 reason=${3:-} key task last
+  [ -n "$reason" ] || reason="stale: $win"
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  fm_wake_append stale "$win" "stale: $win" || exit 1
+  fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
   task=$(window_to_task "$win" "$STATE")
@@ -426,7 +452,139 @@ surface_nonterminal_stale() {  # <window> <hash>
   else
     rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
   fi
-  wake "stale: $win"
+  wake "$reason"
+}
+
+# Claude stall auto-resume wiring. bin/fm-stall-lib.sh owns every decision; this
+# owns the ORDER those decisions are made in, and that order is the safety
+# property. By the time this runs the caller has already established that the
+# pane is not provably working (bin/fm-busy-lib.sh's semantic verdict, the same
+# one the stale path trusts). This adds the second structural gate - the
+# composer is PROVABLY empty (bin/fm-composer-lib.sh's contract, reached through
+# the backend's own classifier) - and only then does rendered banner text get to
+# pick WHICH stall this is. A pane mid-turn, a pane holding a genuine question or
+# permission dialog, and a pane with text somebody already typed each fail one of
+# the two structural gates and never reach the send, whatever their text says. A
+# backend with no composer classifier (zellij) therefore never auto-resumes,
+# which is the right direction to fail.
+#
+# Returns 0 when an auto-resume episode owns this window's poll, so the caller
+# skips its normal stale classification: a worker waiting out its own usage-limit
+# window is not a wedge, and surfacing it every few minutes is exactly the noise
+# this replaces. Returns 1 for every other case - another harness, auto-resume
+# switched off, no banner, an unreadable composer, an episode that has already
+# escalated, or one whose due attempt found an unchanged pane - and the ordinary
+# stale path then runs unchanged.
+# The composer-gate decline is logged on TRANSITION only, for the same reason
+# the `wait` verdict is silent: a limit window can run for hours, and a line per
+# poll would push every other diagnostic out of the size-capped triage log. The
+# last logged (class, composer) tuple is kept at $STATE/.stall-declined-<key>
+# and the line repeats only when that tuple changes; the marker is dropped the
+# moment the pane stops being a declined stall (busy, no banner, or an empty
+# composer), so the next decline is a fresh transition and logs again.
+stall_declined_marker() {  # <window>
+  printf '%s/.stall-declined-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"
+}
+
+stall_note_declined() {  # <window> <task> <class> <composer>
+  local w=$1 task=$2 class=$3 composer=$4 marker tuple
+  marker=$(stall_declined_marker "$w")
+  tuple="$task $class $composer"
+  [ "$(cat "$marker" 2>/dev/null || true)" != "$tuple" ] || return 0
+  triage_log "auto-resume declined for $task ($class stall, composer $composer): $w"
+  printf '%s\n' "$tuple" > "$marker" 2>/dev/null || true
+}
+
+stall_clear_declined() {  # <window>
+  rm -f "$(stall_declined_marker "$1")" 2>/dev/null || true
+}
+
+stall_autoresume_step() {  # <window> <task> <tail40> <busy: 0 = provably working>
+  local w=$1 task=$2 tail=$3 busy=$4 meta harness classification class detail
+  local now verdict arg composer text rc digest
+  local -a send_env
+  [ -n "$task" ] || return 1
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] || return 1
+  harness=$(fm_backend_meta_exact_value "$meta" harness 2>/dev/null || true)
+  fm_stall_enabled "$CONFIG_DIR" "$harness" || return 1
+  now=$(date +%s)
+  digest=$(fm_stall_pane_digest "$tail")
+  if [ "$busy" -eq 0 ]; then
+    # The worker is producing again, so this poll clears any open episode. It is
+    # recorded here rather than skipped, because a resumed worker spends most of
+    # its polls BUSY: without this, an episode would never close and a stall
+    # hours later would inherit a ladder already half spent.
+    fm_stall_note_clear "$STATE" "$task" "$now"
+    stall_clear_declined "$w"
+    return 1
+  fi
+  classification=$(fm_stall_classify "$tail" "$now")
+  class=${classification%% *}
+  detail=${classification#* }
+  if [ "$class" = none ]; then
+    fm_stall_note_clear "$STATE" "$task" "$now"
+    stall_clear_declined "$w"
+    return 1
+  fi
+  composer=$(fm_backend_composer_state "$(window_backend "$w")" "$w" 2>/dev/null || true)
+  if [ "$composer" != empty ]; then
+    # A banner hugging the composer but a composer that is not provably empty:
+    # decline, but record that the stall is still showing so the episode cannot
+    # quietly age out and later read as freshly recovered. The decline itself is
+    # logged on transition only by stall_note_declined above.
+    fm_stall_note_showing "$STATE" "$task" "$now"
+    stall_note_declined "$w" "$task" "$class" "${composer:-unreadable}"
+    return 1
+  fi
+  stall_clear_declined "$w"
+  verdict=$(fm_stall_plan "$STATE" "$task" "$class" "$detail" "$now" "$digest") || return 1
+  arg=${verdict#* }
+  case "${verdict%% *}" in
+    armed)
+      triage_log "auto-resume armed for $task ($class stall, next attempt in ${arg}s): $w"
+      return 0
+      ;;
+    wait)
+      # Silent on purpose. A usage-limit wait can legitimately run for hours, and
+      # logging it every poll would push every other diagnostic out of the
+      # size-capped triage log; the transition was already logged above.
+      return 0
+      ;;
+    unchanged)
+      # The pane has not changed by one byte since the last delivery, so another
+      # steer adds nothing. Release the window to ordinary supervision: if the
+      # worker truly never received the last nudge it will surface as stale,
+      # which is the escalation this case deserves.
+      triage_log "auto-resume skipped for $task ($class stall due, pane unchanged since the last attempt): $w"
+      return 1
+      ;;
+    resume)
+      text=$(fm_stall_resume_text "$class")
+      send_env=(FM_HOME="$FM_HOME")
+      [ -z "${FM_STATE_OVERRIDE:-}" ] || send_env+=(FM_STATE_OVERRIDE="$FM_STATE_OVERRIDE")
+      rc=0
+      fm_run_timed "$STALL_SEND_TIMEOUT" env "${send_env[@]}" \
+        "$FM_STALL_SEND_BIN" "$task" "$text" >/dev/null 2>&1 || rc=$?
+      # A delivery that did not land is still a spent attempt, so a wedged
+      # endpoint walks the same bounded ladder to escalation instead of being
+      # retried on every poll.
+      fm_stall_commit_attempt "$STATE" "$task" "$class" "$detail" "$now" "$digest" || true
+      if [ "$rc" -eq 0 ]; then
+        triage_log "auto-resumed $task after a $class stall (attempt $((arg + 1))): $w"
+      else
+        triage_log "auto-resume delivery failed for $task ($class stall, attempt $((arg + 1)), status $rc): $w"
+      fi
+      return 0
+      ;;
+    escalate)
+      # surface_nonterminal_stale ends in wake(), which exits the watcher, so
+      # this branch never returns to the caller.
+      surface_nonterminal_stale "$w" "$(printf '%s' "$tail" | hash_pane)" \
+        "stale: $w ($arg auto-resume attempts spent on a claude $class stall and the worker is still not producing - inspect it)"
+      ;;
+  esac
+  return 1
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -968,6 +1126,15 @@ EOF
     # content cannot suppress stale detection. Read once per window per poll and
     # reused below so a busy verdict is consistent within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
+    # Claude stall auto-resume runs before stale classification so a worker
+    # waiting out a usage-limit window, or one whose turn a transient upstream
+    # 5xx ended, recovers on its own instead of surfacing as a stopped crew.
+    # Secondmates are excluded: each runs its own watcher over its own home, and
+    # this home has no business steering another firstmate's pane.
+    if [ "$kind" != secondmate ] \
+      && stall_autoresume_step "$w" "$task" "$tail40" "$busy_now"; then
+      continue
+    fi
     if [ "$h" = "$prev" ]; then
       n=$(( $(read_counter "$cf") + 1 ))
       echo "$n" > "$cf"

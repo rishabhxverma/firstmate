@@ -116,6 +116,35 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`verification/supervision.md`](verification/supervision.md#wedge-alarm-channels) for active evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Claude stall auto-resume (config/auto-resume)
+
+A Claude worker whose usage-limit window closes, or whose turn ends on a transient upstream 5xx, leaves a live pane with an idle composer and no further output.
+The watcher recovers that worker itself instead of waiting for a human, so an unattended fleet keeps moving overnight.
+The path applies to `claude`-harness crewmates and scouts only; every other harness is untouched, and secondmate panes are excluded because each secondmate runs its own watcher over its own home.
+`config/auto-resume` (local, gitignored, inherited by secondmate homes) holds `on` or `off` on its first line.
+An absent file means `on`, and only an explicit `off` disables the path, because this is a recovery mechanism and an unreadable preference must not quietly leave a fleet unable to recover.
+
+Detection is deliberately not text-first, because rendered text is the weakest evidence available.
+A pane qualifies only when the worker is not provably working under the semantic busy-state contract ([`architecture.md`](architecture.md), `bin/fm-busy-lib.sh`) and its composer is provably empty (`bin/fm-composer-lib.sh`, reached through the backend's own classifier).
+Only then does the rendered tail decide which stall it is.
+A pane mid-turn, a pane holding a genuine question or permission dialog, and a pane with text somebody already typed each fail one of those two structural gates and are never resumed, whatever their text says.
+A backend with no composer classifier therefore never auto-resumes.
+
+Rendered text is also positional: a banner counts only when it sits immediately above the composer, with nothing but blank rows, box-drawing rows, and the composer's own rendering between them.
+Claude keeps old banners in its transcript after a successful resume, so a banner floating above later output is history, and classifying it would re-nudge a recovered worker whose turn had already finished.
+One wrapped row is allowed, because upstream error banners embed a JSON blob wide enough to wrap; the upper row must end mid-payload for that, so a finished line of output above a stale banner never reads as a wrapped banner.
+A due resume against a pane byte-identical to the last delivery is refused too: typing into a pane nothing has changed since the previous steer adds no information, and such an episode releases the window to the ordinary stale path, which is the escalation a never-moved pane deserves.
+A change between the limit and overload renderings keeps the episode's ladder position rather than restarting it, so a pane flapping between renderings cannot retry forever without spending an attempt toward escalation; only the schedule moves, and only when the new rendering carries a usable reset time.
+
+A usage-limit stall waits for the reset time its own banner names, plus `FM_STALL_RESET_SETTLE`.
+That wait is bounded by `FM_STALL_MAX_RESET_WAIT`, because a banner names a time of day and not a date: one that has already passed today rolls to tomorrow, and read shortly after its own reset that would park a worker whose window has just reopened for a full day.
+Past the bound the ladder takes over, so being early costs one attempt while being a day late would cost the whole point of unattended recovery.
+A transient-error stall, and a limit banner carrying no readable reset time, follow the bounded ladder in `FM_STALL_BACKOFF`.
+Repeated stalls continue one episode rather than restarting that ladder, so a worker that resumes and immediately re-stalls backs off instead of retrying on every poll.
+After `FM_STALL_MAX_ATTEMPTS` deliveries the episode escalates once through the ordinary stale wake, carrying its spent-attempt count so the supervisor inspects instead of resuming again, and stops proposing resumes.
+Routine resumes are recorded in `state/.watch-triage.log` and never escalated.
+`bin/fm-stall-lib.sh`'s header owns the record format, the recognised banner families, and the reset-time parsing rules; `tests/fm-stall-recovery.test.sh` is the regression that pins them.
+
 ## Trace context propagation (config/trace-context / FM_TRACE_CONTEXT)
 
 The optional local, gitignored `config/trace-context` presence flag enables default-off native W3C trace-context propagation.
@@ -542,6 +571,14 @@ FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartb
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or Relay dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
+FM_STALL_BACKOFF='120 300 900 1800'  # seconds between Claude auto-resume attempts, in order; the last rung repeats for every further attempt
+FM_STALL_MAX_ATTEMPTS=4   # auto-resume deliveries allowed against one stall episode before it escalates to a human
+FM_STALL_EPISODE_RESET=1800   # seconds a worker must stay clear of any stall banner before its episode is discarded and the ladder restarts
+FM_STALL_RESET_SETTLE=60   # grace added after a parsed usage-limit reset time before the first resume
+FM_STALL_MAX_RESET_WAIT=21600   # longest wait a parsed reset time may schedule; a banner names a time of day, not a date, so one already past today rolls to tomorrow and must not park a worker for a day - past this bound the ladder takes over
+FM_STALL_SCAN_LINES=20   # non-blank rendered rows above the composer scanned for a stall banner
+FM_STALL_SEND_BIN=      # auto-resume steer transport; defaults to bin/fm-send.sh, overridden only by tests
+FM_STALL_SEND_TIMEOUT=45   # hard bound on one auto-resume delivery
 FM_PROCEVENT_MAX_OUTPUT_BYTES=1048576   # bound on one captured process-to-event result
 FM_PROCEVENT_CLAIM_ROOT=                # machine-wide source claim root; default $XDG_STATE_HOME/firstmate/procevent-claims
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision

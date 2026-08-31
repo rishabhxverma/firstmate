@@ -44,6 +44,17 @@
 #                   families never schedule under --jobs.
 #   -h, --help      print this header
 #
+# Environment:
+#   FM_TEST_SCRIPT_TIMEOUT_SECONDS
+#                   hard per-script bound for the serial path (--jobs 1, the
+#                   default and what every portable-serial CI shard uses): a
+#                   script that hangs past this is killed (bin/fm-timeout-lib.sh,
+#                   whole process group) and recorded as exit=124 instead of
+#                   consuming the job's own timeout with no attribution.
+#                   Default 600 (seconds), well under the CI job's own 900s
+#                   cap. The bounded --jobs>1 path does not apply this bound;
+#                   its scripts are already proven-isolated and fast.
+#
 # Per-script machine-parseable markers (stdout):
 #   FM_TEST_BEGIN <iso8601> <script> family=<family> expected_gate_skip=<class>
 #   FM_TEST_END <iso8601> <script> exit=<code> duration_ms=<n> gate_skip=<true|false>
@@ -72,6 +83,20 @@ set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
+
+# Hard per-script bound for the serial lane (run_one_serial): a hang inside
+# one script must fail fast and name that script instead of consuming the
+# whole job's timeout budget with no attribution. Overridable for a suite
+# whose legitimately slow scripts need more room. The observed remainder is
+# ~19 min total across ~25 scripts with no single script measured over ~3
+# min on a quiet runner, but a loaded machine can stretch an individual
+# script by several times its quiet duration (observed: a normally ~66s
+# script taking >300s under local CPU contention) - a false-positive kill
+# of a merely-slow script would just trade one flake for another. 600s
+# keeps real margin over that kind of contention while staying well under
+# the job's own 900s (15 min) timeout, so a genuine hang still fails fast
+# and named instead of silently eating the whole job budget.
+FM_TEST_SCRIPT_TIMEOUT_SECONDS="${FM_TEST_SCRIPT_TIMEOUT_SECONDS:-600}"
 
 MODE=
 LIST_ONLY=0
@@ -151,6 +176,7 @@ family_for_basename() {
     fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
     fm-session-lock-ancestry.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
+    fm-stall-recovery.test.sh|\
     fm-wake-queue.test.sh|fm-watch-arm.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage.test.sh|\
     fm-watcher-lock.test.sh)
       printf '%s\n' watcher-wake-lock
@@ -876,7 +902,7 @@ families_for_changed_path() {
       printf '%s\n' backend-dispatch
       printf '%s\n' real-herdr-gated
       ;;
-    bin/fm-watch*|bin/fm-wake*|\
+    bin/fm-watch*|bin/fm-wake*|bin/fm-stall-lib.sh|\
     bin/fm-classify-lib.sh|bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
       printf '%s\n' watcher-wake-lock
       ;;
@@ -1528,11 +1554,17 @@ run_one_serial() {
 
   set +e
   # Stream live output while retaining a copy for gate-skip detection.
-  # PIPESTATUS[0] is the test script; tee's exit is ignored for aggregate.
-  bash "$script" 2>&1 | tee "$out"
+  # PIPESTATUS[0] is the bounded script run; tee's exit is ignored for
+  # aggregate. fm_run_timed's own process-group kill means a hung script's
+  # background children die with it instead of outliving the script and
+  # blocking this pipe's EOF (see fm-timeout-lib.sh).
+  fm_run_timed "$FM_TEST_SCRIPT_TIMEOUT_SECONDS" bash "$script" 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
   set -e
   : "${rc:=1}"
+  if [ "$rc" -eq 124 ]; then
+    log "script exceeded its ${FM_TEST_SCRIPT_TIMEOUT_SECONDS}s bound and was killed: $script"
+  fi
 
   end_ms=$(now_ms)
   end_iso=$(now_iso)
@@ -1544,6 +1576,11 @@ run_one_serial() {
 }
 
 if [ "$JOBS" -eq 1 ]; then
+  # Loaded only for the serial path (what run_one_serial's per-script bound
+  # needs), so a minimal fixture repo exercising only the --jobs>1 path is
+  # never required to carry this dependency too.
+  # shellcheck source=bin/fm-timeout-lib.sh
+  . "$ROOT/bin/fm-timeout-lib.sh"
   for script in "${SCRIPTS[@]}"; do
     run_one_serial "$script"
   done
