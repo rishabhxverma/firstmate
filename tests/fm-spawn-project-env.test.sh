@@ -8,6 +8,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=tests/fixtures.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-project-env)
@@ -64,9 +66,15 @@ make_case() {
   printf 'ANTHROPIC_API_KEY=%s\nCURSEFORGE_API_KEY=cf-declared\n' "$SECRET_VALUE" \
     > "$home/config/project-env/demoproj.env"
   fm_git_worktree "$proj" "$wt" "wt-$name"
-  [ "$ignore" = ignore ] && printf '.env\n' > "$wt/.gitignore"
-  mkdir -p "$home/data/$id"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  if [ "$ignore" = ignore ]; then
+    # Through the repo's own exclude file, not a tracked .gitignore: spawn
+    # refuses a pooled worktree that is not clean and resets it to the remote
+    # default branch, so an untracked or locally committed .gitignore would not
+    # survive to the propagation step.
+    mkdir -p "$(dirname "$(git -C "$wt" rev-parse --path-format=absolute --git-path info/exclude)")"
+    printf '.env\n' >> "$(git -C "$wt" rev-parse --path-format=absolute --git-path info/exclude)"
+  fi
+  fm_test_spawn_brief "$home" "$id"
   touch "$home/state/.last-watcher-beat"
   printf '%s|%s|%s|%s|%s\n' "$case_dir" "$home" "$proj" "$wt" "$fakebin"
 }

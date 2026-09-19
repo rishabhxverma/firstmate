@@ -8,14 +8,24 @@
 # lock-owning primary session before it may arm or rewake.
 # This file is sourced by scripts and has no side effects on source.
 
-# Known harness command names; extend when a new adapter is verified.
-FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
+# Cursor process identity is NOT expressible as a command-name pattern and is
+# deliberately not added to the tables below: Cursor's installed names are
+# cursor-agent and the far-too-generic legacy alias `agent`, and it runs as a
+# bundled node script. bin/fm-cursor-lib.sh is the fleet's single owner of that
+# decision, so this file delegates to it rather than widening the name match.
+# shellcheck source=bin/fm-cursor-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/fm-cursor-lib.sh"
+
+# Known harness command names; extend when a new adapter is verified. omp is
+# anchored exactly like pi: its process name is the bare word `omp` (verified,
+# omp 18.1.11), and a substring match would claim ompd or comp.
+FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$'
 
 # The same harnesses as exact executable names. Keep in sync with
 # FM_HARNESS_RE. Used only for the stricter path evidence below, where the
 # loose regex would also match ordinary firstmate paths such as
 # bin/fm-claude-stop-autoarm.sh.
-FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi)
+FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi omp)
 
 # Print the exact harness name carried by executable path $1 - its own basename
 # or any directory component - or return 1.
@@ -48,6 +58,7 @@ fm_harness_path_name() {  # <path>
 #      name and ignores argv[0] entirely, so a version-named Claude Code binary
 #      is identified by its install path on macOS and by argv[0] on Linux.
 #   3. a bare interpreter (node, python) running a harness script path.
+#   4. Cursor's own structural identity, owned by bin/fm-cursor-lib.sh.
 FM_HARNESS_IS_CLAUDE=0
 fm_harness_process_matches() {  # <comm> <args>
   local comm=$1 args=$2 base argv0 name
@@ -71,6 +82,11 @@ fm_harness_process_matches() {  # <comm> <args>
       fi
       ;;
   esac
+  # Cursor: its own owner decides, from Cursor's name or versioned install tree
+  # in the command path or argv[0]. Without this a Cursor primary can never
+  # locate its own harness in the ancestry, so every session start refuses the
+  # fleet lock as read-only and the park can never arm.
+  fm_cursor_process_matches "$comm" "$args" "$argv0" && return 0
   return 1
 }
 
@@ -106,7 +122,12 @@ fm_harness_ancestry_pids() {
       break
     fi
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+    # Examine the top of the chain before stopping. Inside a PID namespace the
+    # harness itself is pid 1, so stopping as soon as the next pid is 1 hides the
+    # very process this walk exists to find. A host's real pid 1 (init, systemd,
+    # launchd) is not harness-shaped, so fm_harness_process_matches rejects it.
+    case "$pid" in '' | *[!0-9]*) break ;; esac
+    [ "$pid" -ge 1 ] || break
   done
   [ "$printed" -eq 1 ]
 }
@@ -159,4 +180,30 @@ fm_session_lock_owned_by_self() {
 $pids
 EOF
   return 1
+}
+
+# True when state dir $1 records a live verified harness outside this process's
+# contiguous harness ancestry. Sets FM_SESSION_LOCK_FOREIGN_OWNER_PID for a
+# diagnostic caller. Malformed, missing, dead, and ancestry-uncertain locks are
+# not foreign-owner evidence.
+# shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
+FM_SESSION_LOCK_FOREIGN_OWNER_PID=
+fm_session_lock_foreign_owner_live() {
+  local state=$1 lock_pid pids pid
+  FM_SESSION_LOCK_FOREIGN_OWNER_PID=
+  [ -f "$state/.lock" ] && [ ! -L "$state/.lock" ] || return 1
+  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
+  case "$lock_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_harness_pid_alive "$lock_pid" || return 1
+  pids=$(fm_harness_ancestry_pids) || return 1
+  while IFS= read -r pid; do
+    [ "$pid" = "$lock_pid" ] && return 1
+  done <<EOF
+$pids
+EOF
+  # shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
+  FM_SESSION_LOCK_FOREIGN_OWNER_PID=$lock_pid
+  return 0
 }

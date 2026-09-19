@@ -10,6 +10,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=tests/fixtures.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-meta-publish)
@@ -70,8 +72,7 @@ make_case() {  # <name> -> echoes home|proj|wt|fakebin|id
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
   id="$name-z1"
-  mkdir -p "$home/data/$id"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  fm_test_spawn_brief "$home" "$id"
   printf '%s|%s|%s|%s|%s\n' "$home" "$proj" "$wt" "$fakebin" "$id"
 }
 
@@ -102,7 +103,7 @@ done
 grep -q '^backend=' "$META" && fail "the default tmux spawn must not write backend="
 [ "$(tail -c 1 "$META" | od -An -c | tr -d ' \n')" = '\n' ] \
   || fail "meta must end with a newline"
-ls "$HOME_DIR"/state/.*.meta.publish.* >/dev/null 2>&1 \
+ls "$HOME_DIR"/state/.*.meta.spawn.* >/dev/null 2>&1 \
   && fail "publication temp file left behind on the healthy path"
 pass "a healthy spawn publishes a complete tmux meta record and no temp file"
 printf -- '--- published meta (%s) ---\n' "$CASE_ID"
@@ -120,11 +121,11 @@ STATUS=$?
 printf -- '--- failed-publication spawn (exit %s) ---\n%s\n' "$STATUS" "$OUT"
 [ "$STATUS" -ne 0 ] || fail "a spawn whose metadata write fails must not report success"
 case "$OUT" in
-  *"cannot publish task metadata"*"aborting the spawn"*) : ;;
+  *"task record for"*"could not be published"*) : ;;
   *) fail "the abort must name the metadata publication failure" ;;
 esac
 [ ! -e "$STATE_DIR/$CASE_ID.meta" ] \
   || fail "an aborted spawn must not leave a meta record behind"
-ls "$STATE_DIR"/.*.meta.publish.* >/dev/null 2>&1 \
+ls "$STATE_DIR"/.*.meta.spawn.* >/dev/null 2>&1 \
   && fail "an aborted spawn must not leave a publication temp file behind"
 pass "a failed metadata write aborts the spawn and publishes no record"

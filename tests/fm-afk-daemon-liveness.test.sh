@@ -42,6 +42,12 @@ exit 0
 SHIM
 chmod +x "$WORK/shim/stat"
 
+# The helpers pin the platform stat by absolute path where the platform's flags
+# differ (macOS: /usr/bin/stat), so a PATH shim cannot reach them there. Each
+# section-1 case therefore also replaces the helper's own mtime reader, after
+# sourcing, with one that exits 0 and prints the same non-integer text.
+BAD_MTIME='printf "  File: /\\n"'
+
 # --- 1. every age helper must fail SAFE, never return an empty operand -------
 # Each helper is exercised in its own shell with the shim first on PATH and with
 # `set -u` active, exactly as the daemon and watcher run.
@@ -70,17 +76,17 @@ check_age_helper() {  # <label> <script> <load-snippet> <call>
 
 check_age_helper "fm-supervise-daemon.sh _file_age" \
   "$ROOT/bin/fm-supervise-daemon.sh" \
-  "FM_HOME=$WORK; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-supervise-daemon.sh' >/dev/null 2>&1 || true" \
+  "FM_HOME=$WORK; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-supervise-daemon.sh' >/dev/null 2>&1 || true; _stat_file_mtime() { $BAD_MTIME; }" \
   "_file_age '$WORK'"
 
 check_age_helper "fm-watch.sh age_of" \
   "$ROOT/bin/fm-watch.sh" \
-  "FM_HOME=$WORK; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-watch.sh' >/dev/null 2>&1 || true" \
+  "FM_HOME=$WORK; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-watch.sh' >/dev/null 2>&1 || true; stat_mtime() { $BAD_MTIME; }" \
   "age_of '$WORK'"
 
 check_age_helper "fm-wake-lib.sh fm_path_age" \
   "$ROOT/bin/fm-wake-lib.sh" \
-  "FM_HOME=$WORK; STATE=$WORK/state; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-wake-lib.sh' >/dev/null 2>&1 || true" \
+  "FM_HOME=$WORK; STATE=$WORK/state; FM_STATE_OVERRIDE=$WORK/state; . '$ROOT/bin/fm-wake-lib.sh' >/dev/null 2>&1 || true; fm_path_mtime() { $BAD_MTIME; }" \
   "fm_path_age '$WORK'"
 
 # --- 2. the gate the incident actually killed -------------------------------
