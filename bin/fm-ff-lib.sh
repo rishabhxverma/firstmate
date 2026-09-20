@@ -6,6 +6,8 @@
 # clean fast-forward, never forcing, merging, or stashing" used by every sync
 # path:
 #   - /updatefirstmate (bin/fm-update.sh) pulls from origin: base_mode "origin".
+#   - upstream_report (below) is the one READ-ONLY exception to "advance": a fork
+#     consults its community `upstream` remote but never moves HEAD for it.
 #   - the local-HEAD secondmate sync (bin/fm-spawn.sh on launch, bin/fm-bootstrap.sh
 #     on startup) follows the PRIMARY checkout's current default-branch commit:
 #     base_mode is that local commit, with NO fetch and no origin dependency.
@@ -251,6 +253,32 @@ remote_sync_failure_reason() { # <exit-status> <output>
   first_line "$2"
 }
 
+# One line naming WHY a target counts as dirty, so a skip is actionable rather
+# than a bare "dirty working tree": how many paths are modified or staged versus
+# untracked, and the first few names. Untracked-only is said outright, because
+# that is the common case (a stray helper script) and the operator's fix differs
+# from the one for real edits. Never lists more than three names.
+dirty_summary() {
+  local dir=$1 ignore_seed_marker=${2:-no}
+  git -C "$dir" status --porcelain 2>/dev/null | awk -v marker="$SUB_HOME_MARKER" -v ignore="$ignore_seed_marker" '
+    ignore == "yes" && $0 == "?? " marker { next }
+    {
+      path = substr($0, 4)
+      if (substr($0, 1, 2) == "??") { untracked++ } else { changed++ }
+      total++
+      if (total <= 3) names = names (names == "" ? "" : ", ") path
+    }
+    END {
+      if (total == 0) exit
+      detail = ""
+      if (changed > 0) detail = changed " modified"
+      if (untracked > 0) detail = detail (detail == "" ? "" : ", ") untracked " untracked"
+      if (changed == 0) detail = "untracked only: " untracked " file" (untracked == 1 ? "" : "s")
+      more = total > 3 ? " and " (total - 3) " more" : ""
+      printf "%s: %s%s", detail, names, more
+    }'
+}
+
 dirty_status() {
   local dir=$1 ignore_seed_marker=${2:-no}
   if [ "$ignore_seed_marker" = yes ]; then
@@ -417,7 +445,7 @@ ff_target() {
   fi
 
   if [ -n "$(dirty_status "$dir" "$ignore_seed_marker")" ]; then
-    echo "$label: skipped: dirty working tree"
+    echo "$label: skipped: dirty working tree ($(dirty_summary "$dir" "$ignore_seed_marker"))"
     return 0
   fi
 
@@ -482,6 +510,111 @@ ff_target() {
     echo "$label: updated $before..$after (instructions changed: $instr)"
   else
     echo "$label: updated $before..$after"
+  fi
+  return 0
+}
+
+# Consult the community upstream for a fork, READ-ONLY.
+#
+# /updatefirstmate follows origin, and on a fork origin is the fork itself, so it
+# can never see a community change. This reports how a checkout stands against
+# the `upstream` remote without touching it: it fetches the remote-tracking ref
+# and compares, and it never merges, fast-forwards, stashes, or moves HEAD. A
+# real catch-up on a fork with local commits is a MERGE, and a merge belongs on
+# a task branch delivered through the fork's own PR path, where conflicts get
+# judged; running one inside the live primary checkout could strand the running
+# session mid-conflict. So the only honest outputs are a status and, when the
+# checkout is behind, how far and whether the merge would be clean.
+#
+# Sets UPSTREAM_STATUS = absent|current|behind|diverged|skipped and prints one
+# line, except for "absent" (no `upstream` remote, or one that points at the same
+# repository as origin, where origin was already consulted): that prints nothing
+# and changes nothing, so a repo without an upstream behaves exactly as before.
+#   current   - upstream's tip is already contained in HEAD
+#   behind    - HEAD is an ancestor of upstream (a plain catch-up, nothing local)
+#   diverged  - both sides hold commits the other lacks (a true merge)
+# UPSTREAM_BEHIND / UPSTREAM_AHEAD carry the two commit counts when known.
+UPSTREAM_STATUS="absent"
+UPSTREAM_BEHIND=0
+UPSTREAM_AHEAD=0
+
+# Normalise a remote URL enough to tell whether two remotes name one repository.
+remote_url_key() {
+  local url=$1
+  url=${url%/}
+  url=${url%.git}
+  url=${url#*://}
+  url=${url#git@}
+  printf '%s' "$url" | tr ':' '/' | tr '[:upper:]' '[:lower:]'
+}
+
+upstream_report() {  # <dir> <label>
+  local dir=$1 label=$2 up_url origin_url default base cur counts merge_out rc prediction
+  UPSTREAM_STATUS="absent"
+  UPSTREAM_BEHIND=0
+  UPSTREAM_AHEAD=0
+
+  up_url=$(git -C "$dir" remote get-url upstream 2>/dev/null) || return 0
+  origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+  if [ -n "$origin_url" ] && [ "$(remote_url_key "$up_url")" = "$(remote_url_key "$origin_url")" ]; then
+    return 0
+  fi
+
+  UPSTREAM_STATUS="skipped"
+  default=$(default_branch "$dir") || {
+    echo "$label upstream: skipped: cannot determine default branch"
+    return 0
+  }
+  cur=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || echo "")
+  if [ -z "$cur" ]; then
+    echo "$label upstream: skipped: detached HEAD, expected $default"
+    return 0
+  fi
+  if [ "$cur" != "$default" ]; then
+    echo "$label upstream: skipped: on $cur, expected $default"
+    return 0
+  fi
+  if ! git -C "$dir" fetch upstream --quiet --no-tags 2>/dev/null; then
+    echo "$label upstream: skipped: fetch failed"
+    return 0
+  fi
+  base="upstream/$default"
+  if ! git -C "$dir" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    echo "$label upstream: skipped: $base does not exist"
+    return 0
+  fi
+
+  counts=$(git -C "$dir" rev-list --left-right --count "HEAD...$base" 2>/dev/null) || {
+    echo "$label upstream: skipped: cannot compare HEAD with $base"
+    return 0
+  }
+  UPSTREAM_AHEAD=${counts%%[[:space:]]*}
+  UPSTREAM_BEHIND=${counts##*[[:space:]]}
+
+  if [ "$UPSTREAM_BEHIND" -eq 0 ]; then
+    UPSTREAM_STATUS="current"
+    echo "$label upstream: already contains $base ($UPSTREAM_AHEAD local commits ahead)"
+    return 0
+  fi
+
+  # A dry-run merge in memory (git 2.38+) says whether the catch-up is clean
+  # without touching the index or working tree. Older git, or any other failure,
+  # just reports the prediction as unavailable.
+  rc=0
+  merge_out=$(git -C "$dir" merge-tree --write-tree --name-only --no-messages HEAD "$base" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0) prediction="would merge cleanly" ;;
+    1) prediction="$(printf '%s\n' "$merge_out" | sed '1d;/^$/d' | sort -u | wc -l | tr -d ' ') conflicting files" ;;
+    *) prediction="conflict check unavailable" ;;
+  esac
+
+  if [ "$UPSTREAM_AHEAD" -eq 0 ]; then
+    UPSTREAM_STATUS="behind"
+    echo "$label upstream: $UPSTREAM_BEHIND commits behind $base, no local commits ($prediction); catching up is a merge task, not done here"
+  else
+    # shellcheck disable=SC2034 # read by bin/fm-update.sh after the call
+    UPSTREAM_STATUS="diverged"
+    echo "$label upstream: diverged from $base: $UPSTREAM_BEHIND commits behind, $UPSTREAM_AHEAD local commits ahead ($prediction); a real merge is needed (merge, never rebase), not done here"
   fi
   return 0
 }

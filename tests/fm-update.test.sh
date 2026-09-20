@@ -22,6 +22,10 @@
 #     restart is also what re-resolves launch-time harness wiring; a live mate
 #     whose runtime cannot prove a restart falls to nudge-secondmates; and a mate
 #     whose home was skipped or whose endpoint is stopped gets no action at all.
+#   - A fork's `upstream` remote is consulted read-only on every update: counts,
+#     a predicted merge outcome, and an `upstream-merge:` summary, with HEAD never
+#     moved; no upstream (or one duplicating origin) prints nothing extra.
+#   - A dirty skip names what made the target dirty.
 #   - Secondmate homes resolve from both state/<id>.meta and the
 #     data/secondmates.md registry, deduped, and the firstmate repo is never
 #     re-processed as one of its own secondmates.
@@ -556,6 +560,175 @@ test_primary_update_rebinds_local_watch() {
   pass "T12 a self-update rebinds a locally armed watch on the primary"
 }
 
+# --- T13-T18: community upstream is consulted, read-only ---------------------
+# A fork's origin is the fork itself, so origin alone can never surface a
+# community change. The update also compares the primary with an `upstream`
+# remote and reports how far behind it is, but it never merges, fast-forwards,
+# stashes, or moves HEAD: a real catch-up is a merge task, not a fast-forward.
+
+# Give a world an `upstream` remote: a bare clone of origin as it stands, wired
+# into the firstmate clone and its own seed clone for later bumps.
+add_upstream() {
+  local w=$1
+  git clone -q --bare "$w/origin.git" "$w/upstream.git"
+  git -C "$w/main" remote add upstream "$w/upstream.git"
+  git clone -q "$w/upstream.git" "$w/upseed" 2>/dev/null
+}
+
+# Advance upstream by one commit that touches <file>.
+bump_upstream() {
+  local w=$1 file=$2
+  printf 'up-%s\n' "$RANDOM" >> "$w/upseed/$file"
+  git -C "$w/upseed" add -A
+  git -C "$w/upseed" commit -qm "upstream-bump-$file"
+  git -C "$w/upseed" push -q origin main
+}
+
+# Add a commit to the fork (pushed to origin, so origin stays a fast-forward
+# target of nothing and the fork is genuinely ahead of upstream).
+fork_commit() {
+  local w=$1 file=$2
+  printf 'fork-%s\n' "$RANDOM" >> "$w/main/$file"
+  git -C "$w/main" add -A
+  git -C "$w/main" commit -qm "fork-$file"
+  git -C "$w/main" push -q origin main
+}
+
+test_no_upstream_remote_prints_nothing_extra() {
+  local w out
+  w=$(new_world t13)
+  bump_origin "$w" readme
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate: updated " "origin update is unchanged"
+  assert_not_contains "$out" "upstream" "no upstream remote means no upstream line at all"
+  pass "T13 a repo with no upstream remote behaves exactly as before"
+}
+
+test_upstream_same_repo_as_origin_is_silent() {
+  local w out
+  w=$(new_world t14)
+  git -C "$w/main" remote add upstream "$w/origin.git"
+
+  out=$(run_update "$w")
+
+  assert_not_contains "$out" "upstream" "an upstream naming the same repository as origin was already consulted"
+  pass "T14 an upstream that duplicates origin is not reported twice"
+}
+
+test_upstream_current_is_reported_none() {
+  local w out
+  w=$(new_world t15)
+  add_upstream "$w"
+  fork_commit "$w" README.md
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate upstream: already contains upstream/main (1 local commits ahead)" "contained upstream reported"
+  assert_contains "$out" "upstream-merge: none" "nothing to merge"
+  pass "T15 an upstream already contained in the fork reports none"
+}
+
+test_upstream_diverged_reports_merge_needed_and_touches_nothing() {
+  local w out head_before
+  w=$(new_world t16)
+  add_upstream "$w"
+  fork_commit "$w" README.md
+  bump_upstream "$w" AGENTS.md
+  bump_upstream "$w" AGENTS.md
+  git -C "$w/main" fetch -q origin
+  head_before=$(git -C "$w/main" rev-parse HEAD)
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate upstream: diverged from upstream/main: 2 commits behind, 1 local commits ahead (would merge cleanly)" "divergence counted, clean merge predicted"
+  assert_contains "$out" "a real merge is needed (merge, never rebase), not done here" "the report says what is needed"
+  assert_contains "$out" "upstream-merge: needed" "summary line asks for a merge task"
+  [ "$(git -C "$w/main" rev-parse HEAD)" = "$head_before" ] || fail "the upstream check moved HEAD"
+  [ -z "$(git -C "$w/main" status --porcelain)" ] || fail "the upstream check dirtied the checkout"
+  [ "$(git -C "$w/main" rev-list --merges --count HEAD)" -eq 0 ] || fail "the upstream check created a merge commit"
+  pass "T16 a diverged upstream reports counts and a merge need, moving nothing"
+}
+
+test_upstream_conflicts_are_predicted() {
+  local w out
+  w=$(new_world t17)
+  add_upstream "$w"
+  printf 'fork-side\n' > "$w/main/AGENTS.md"
+  git -C "$w/main" add -A
+  git -C "$w/main" commit -qm fork-agents
+  git -C "$w/main" push -q origin main
+  printf 'upstream-side\n' > "$w/upseed/AGENTS.md"
+  git -C "$w/upseed" add -A
+  git -C "$w/upseed" commit -qm upstream-agents
+  git -C "$w/upseed" push -q origin main
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "(1 conflicting files)" "the dry-run merge names the conflict count"
+  assert_contains "$out" "upstream-merge: needed" "a conflicting catch-up still needs a merge task"
+  pass "T17 a conflicting upstream is predicted without attempting the merge"
+}
+
+test_upstream_behind_only_is_not_fast_forwarded() {
+  local w out head_before
+  w=$(new_world t18)
+  add_upstream "$w"
+  bump_upstream "$w" README.md
+  head_before=$(git -C "$w/main" rev-parse HEAD)
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate upstream: 1 commits behind upstream/main, no local commits" "plain catch-up reported"
+  assert_contains "$out" "upstream-merge: needed" "even a plain catch-up is left to a merge task"
+  [ "$(git -C "$w/main" rev-parse HEAD)" = "$head_before" ] \
+    || fail "upstream must never advance the primary, or main would move past origin without a PR"
+  pass "T18 a behind-only upstream is reported, never fast-forwarded"
+}
+
+test_upstream_fetch_failure_is_unchecked() {
+  local w out
+  w=$(new_world t19)
+  git -C "$w/main" remote add upstream "$w/does-not-exist.git"
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate upstream: skipped: fetch failed" "an unreachable upstream is reported"
+  assert_contains "$out" "upstream-merge: unchecked" "and never read as up to date"
+  assert_contains "$out" "reread-firstmate: no" "the rest of the update still completes"
+  pass "T19 an unreachable upstream is unchecked, not current"
+}
+
+test_dirty_skip_names_untracked_files() {
+  local w out
+  w=$(new_world t20)
+  bump_origin "$w" readme
+  printf 'x\n' > "$w/main/stray-one.sh"
+  printf 'x\n' > "$w/main/stray-two.sh"
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate: skipped: dirty working tree (untracked only: 2 files: stray-one.sh, stray-two.sh)" \
+    "an untracked-only skip says so and names the files"
+  [ -f "$w/main/stray-one.sh" ] || fail "an untracked file was removed"
+  pass "T20 a dirty skip names what made the target dirty"
+}
+
+test_dirty_skip_counts_modified_files() {
+  local w out
+  w=$(new_world t21)
+  bump_origin "$w" readme
+  printf 'edit\n' >> "$w/main/README.md"
+  printf 'x\n' > "$w/main/stray.sh"
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate: skipped: dirty working tree (1 modified, 1 untracked: README.md, stray.sh)" \
+    "a mixed skip counts both kinds"
+  pass "T21 a dirty skip separates modified from untracked"
+}
+
 test_updates_main_and_secondmate
 test_reread_gate_is_instruction_only
 test_bin_only_advance_restarts
@@ -572,5 +745,14 @@ test_firstmate_wrong_branch_skipped
 test_firstmate_detached_head_skipped
 test_unsafe_secondmate_home_skipped_before_git_update
 test_primary_update_rebinds_local_watch
+test_no_upstream_remote_prints_nothing_extra
+test_upstream_same_repo_as_origin_is_silent
+test_upstream_current_is_reported_none
+test_upstream_diverged_reports_merge_needed_and_touches_nothing
+test_upstream_conflicts_are_predicted
+test_upstream_behind_only_is_not_fast_forwarded
+test_upstream_fetch_failure_is_unchecked
+test_dirty_skip_names_untracked_files
+test_dirty_skip_counts_modified_files
 
 echo "# all fm-update tests passed"

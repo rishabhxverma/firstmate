@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Self-update a running firstmate and its secondmates to the latest origin.
+# Self-update a running firstmate and its secondmates to the latest origin,
+# and report how far a fork has fallen behind its community upstream.
 #
 # Mechanical half of the /updatefirstmate skill. Fast-forwards the running
 # firstmate repo's default branch from origin, then fast-forwards every
@@ -10,6 +11,16 @@
 # A secondmate divergence whose complete local tree result is already present at
 # the target is reconciled with reset --keep; every other unsafe target is
 # skipped and reported, with divergence recorded durably by fm-ff-lib.sh.
+# On a fork, origin is the fork itself, so following origin alone can never pick
+# up a community change. When the repo has an `upstream` remote that names a
+# different repository, the primary is also compared against upstream's default
+# branch (bin/fm-ff-lib.sh's upstream_report). That comparison is READ-ONLY: it
+# fetches and counts, and never merges, fast-forwards, stashes, or moves HEAD,
+# because a catch-up on a fork with local commits is a merge that belongs on a
+# task branch delivered through the fork's own PR path, not inside the live
+# primary checkout. Secondmate homes keep following origin, so they receive
+# community changes only once a merge has landed there. A repo with no distinct
+# `upstream` remote prints nothing extra.
 # A tracked-files update never touches the gitignored operational
 # dirs (data/, state/, config/, projects/, .no-mistakes/), so a secondmate's
 # in-flight work is never disrupted. Worktrees of this repo share one object
@@ -26,6 +37,10 @@
 # tmux actions the skill performs. The script's job is the safe git mechanics
 # plus a parseable summary telling the caller what to do next:
 #   - one status line per target (updated/already current/skipped)
+#   - upstream-merge: needed|none|unchecked   (only when a distinct `upstream`
+#     remote exists: needed = the community upstream holds commits this
+#     checkout lacks and a merge task must land them; none = already contained;
+#     unchecked = the comparison could not run, reason on the status line)
 #   - reread-firstmate: yes|no    (did the running firstmate's instructions change)
 #   - restart-secondmates: fm-<id>...|none (every live secondmate this pass left
 #     on origin's tip - advanced OR already there - whose recorded runtime can
@@ -103,6 +118,16 @@ if [ "$FF_STATUS" = "updated" ]; then
   # this test suite uses to point fm-update.sh at a fixture checkout).
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-procevent-when.sh" rebind-all || true
 fi
+
+# Community upstream (read-only; see the header). Runs after the origin update so
+# a merge that already landed on origin is seen as contained.
+upstream_report "$FM_ROOT" "firstmate"
+case "$UPSTREAM_STATUS" in
+  behind|diverged) upstream_merge="needed" ;;
+  current) upstream_merge="none" ;;
+  skipped) upstream_merge="unchecked" ;;
+  *) upstream_merge="" ;;
+esac
 
 # --- secondmates -----------------------------------------------------------
 # Every live secondmate this pass leaves on origin's tip is restarted, whether it
@@ -241,6 +266,7 @@ fi
 # two lines below are disjoint by construction: no mate is ever restarted and
 # then also steered about the instructions it just relaunched on.
 
+[ -z "$upstream_merge" ] || echo "upstream-merge: $upstream_merge"
 echo "reread-firstmate: $reread_firstmate"
 echo "restart-secondmates:${FF_RESTART_WINDOWS:- none}"
 echo "nudge-secondmates:${FF_STEER_WINDOWS:- none}"
