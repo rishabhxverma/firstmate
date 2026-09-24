@@ -35,6 +35,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# shellcheck source=tests/fixtures.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 
 SESSION_START="$ROOT/bin/fm-session-start.sh"
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
@@ -252,6 +254,18 @@ case "$*" in
   *"ppid="*)
     [ -n "${FM_FAKE_HARNESS_PID:-}" ] || exit 1
     /bin/ps -o ppid= -p "$pid"
+    ;;
+  *"command="*)
+    # Distinct from the "comm=" (short field) case above: bin/fm-afk-start.sh's
+    # daemon_pid_matches queries the long "command=" field to identify a live
+    # away-mode daemon by its command line. Recognized only for the one real
+    # pid fm_test_start_fake_afk_daemon started (tests/fixtures.sh); every
+    # other pid gets no daemon match, matching the harness-ancestry cases above.
+    if [ -n "${FM_FAKE_AFK_DAEMON_PID:-}" ] && [ "$pid" = "$FM_FAKE_AFK_DAEMON_PID" ]; then
+      printf '/bin/sh fm-supervise-daemon.sh\n'
+      exit 0
+    fi
+    exit 1
     ;;
 esac
 exit 1
@@ -2443,8 +2457,14 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   printf 'quiet\n%s\n' "$(date '+%s')" > "$home/state/.afk"
+  # The "supervision is active" claim is health-gated (bin/fm-afk-health.sh), so
+  # this test's own mode-selection assertion needs a genuinely live, ready
+  # daemon behind the flag, not just the flag itself.
+  fm_test_start_fake_afk_daemon "$home"
+  touch "$home/state/.subsuper-daemon-ready"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  fm_test_stop_fake_afk_daemon
 
   assert_contains "$out" "quiet-mode supervision is active" "AFK digest did not report quiet mode for a quiet-content flag"
   assert_contains "$out" "only an explicit /quiet off exits it" "AFK digest lost the explicit-only exit rule"
@@ -2466,8 +2486,16 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   : > "$home/state/.afk"
+  # This test is about MODE selection (an empty legacy flag reads as away, not
+  # quiet), not daemon health; test_next_step_afk_delegates_to_daemon owns the
+  # flag-with-no-daemon (degraded) case. The "supervision is active" claim is
+  # health-gated (bin/fm-afk-health.sh), so it needs a genuinely live, ready
+  # daemon behind the flag to be true.
+  fm_test_start_fake_afk_daemon "$home"
+  touch "$home/state/.subsuper-daemon-ready"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  fm_test_stop_fake_afk_daemon
 
   assert_contains "$out" "away-mode supervision is active" "a legacy empty .afk flag was not read as away mode"
   assert_contains "$out" "Away mode is active" "a legacy empty .afk flag did not drive away-mode next-step guidance"

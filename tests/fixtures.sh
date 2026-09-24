@@ -330,3 +330,38 @@ make_stubs() {
   fm_test_fake_sleep_noop "$fakebin"
   printf '%s\n' "$fakebin"
 }
+
+# --- away-mode daemon liveness ----------------------------------------------
+
+# fm_test_start_fake_afk_daemon <dir>
+# A live away-mode daemon, recorded in the daemon lock the way
+# bin/fm-afk-start.sh records it. bin/fm-afk-health.sh identifies the holder by
+# its command, so a real process running a script with the daemon's own name is
+# a faithful stand-in for the liveness question without launching the daemon.
+# Sets FM_TEST_AFK_DAEMON_PID for fm_test_stop_fake_afk_daemon to reap, and
+# exports it as FM_FAKE_AFK_DAEMON_PID so a fake `ps` on PATH (make_fake_ps_*)
+# can recognize this one real pid and answer its `-o command=` query, matching
+# how it already recognizes FM_FAKE_HARNESS_PID for `-o comm=`/`-o args=`.
+# Does not touch state/.subsuper-daemon-ready; a caller wanting AFK_HEALTHY
+# rather than AFK_STARTING touches that itself once the daemon is "past its
+# first tick".
+FM_TEST_AFK_DAEMON_PID=
+fm_test_start_fake_afk_daemon() {
+  local dir=$1 fake
+  fake="$dir/fakebin/fm-supervise-daemon.sh"
+  mkdir -p "$dir/fakebin" "$dir/state/.supervise-daemon.lock"
+  printf '#!/bin/sh\nsleep 120\n' > "$fake"
+  chmod +x "$fake"
+  "$fake" >/dev/null 2>&1 &
+  FM_TEST_AFK_DAEMON_PID=$!
+  export FM_FAKE_AFK_DAEMON_PID=$FM_TEST_AFK_DAEMON_PID
+  printf '%s\n' "$FM_TEST_AFK_DAEMON_PID" > "$dir/state/.supervise-daemon.lock/pid"
+}
+
+fm_test_stop_fake_afk_daemon() {
+  [ -n "$FM_TEST_AFK_DAEMON_PID" ] || return 0
+  kill "$FM_TEST_AFK_DAEMON_PID" 2>/dev/null || true
+  wait "$FM_TEST_AFK_DAEMON_PID" 2>/dev/null || true
+  FM_TEST_AFK_DAEMON_PID=
+  unset FM_FAKE_AFK_DAEMON_PID
+}

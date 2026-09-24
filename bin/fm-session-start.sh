@@ -875,41 +875,52 @@ done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "AFK"
+# The flag alone is NOT evidence of supervision: while it exists the watcher
+# drops to one-shot and hands triage to the daemon, so a flag with a dead daemon
+# means nothing is triaging at all. bin/fm-afk-health.sh owns that verdict, and
+# it gates every "supervision is active" claim below - the posture record and
+# the legacy flag both describe intent, never the daemon's actual pulse, so
+# printing them unconditionally would let a dead daemon report itself healthy.
+AFK_SUPERVISED=0
+AFK_HEALTH_OUT=
+if [ -e "$STATE/.afk" ]; then
+  AFK_HEALTH_OUT=$("$SCRIPT_DIR/fm-afk-health.sh" 2>&1) || true
+  case "$AFK_HEALTH_OUT" in
+    AFK_HEALTHY*|AFK_STARTING*) AFK_SUPERVISED=1 ;;
+  esac
+fi
 # The away posture is the record (bin/fm-afk-contract.sh); the legacy flag
 # still marks a running daemon on the harnesses that launch one.
 if [ -f "$STATE/.afk-contract" ]; then
   printf 'present - away posture recorded at %s (hold-for-return only; bin/fm-afk-contract.sh readback for the mandate)' \
     "$("$SCRIPT_DIR/fm-afk-contract.sh" field entered 2>/dev/null || printf unknown)"
   if [ -e "$STATE/.afk" ]; then
-    if [ "$AFK_MODE" = quiet ]; then
-      printf '; the quiet daemon owns the watcher.\n'
+    if [ "$AFK_SUPERVISED" -eq 1 ]; then
+      if [ "$AFK_MODE" = quiet ]; then
+        printf '; the quiet daemon owns the watcher.\n'
+      else
+        printf '; the away daemon owns the watcher.\n'
+      fi
     else
-      printf '; the away daemon owns the watcher.\n'
+      printf '; but NOT SUPERVISED - the %s daemon is not triaging.\n' "$AFK_MODE"
     fi
   else
     printf '; no daemon runs, the ordinary supervision session continues.\n'
   fi
 elif [ -e "$STATE/.afk" ]; then
-  if [ "$AFK_MODE" = quiet ]; then
-    printf 'present - quiet-mode supervision is active; the daemon owns the watcher, only an explicit /quiet off exits it (legacy flag with no posture record).\n'
+  if [ "$AFK_SUPERVISED" -eq 1 ]; then
+    if [ "$AFK_MODE" = quiet ]; then
+      printf 'present - quiet-mode supervision is active; the daemon owns the watcher, only an explicit /quiet off exits it (legacy flag with no posture record).\n'
+    else
+      printf 'present - away-mode supervision is active; the daemon owns the watcher (legacy flag with no posture record).\n'
+    fi
   else
-    printf 'present - away-mode supervision is active; the daemon owns the watcher (legacy flag with no posture record).\n'
+    printf 'present but NOT SUPERVISED - the %s-mode flag is set and no daemon is triaging (legacy flag with no posture record).\n' "$AFK_MODE"
   fi
 else
   printf 'absent\n'
 fi
-# The flag alone is NOT evidence of supervision: while it exists the watcher
-# drops to one-shot and hands triage to the daemon, so a flag with a dead daemon
-# means nothing is triaging at all. bin/fm-afk-health.sh owns that verdict, so
-# the digest reports it beside the posture instead of trusting the flag.
-if [ -e "$STATE/.afk" ]; then
-  AFK_HEALTH_OUT=$("$SCRIPT_DIR/fm-afk-health.sh" 2>&1) || true
-  case "$AFK_HEALTH_OUT" in
-    AFK_HEALTHY*|AFK_STARTING*) ;;
-    *) printf 'NOT SUPERVISED - the away-mode flag is set and no daemon is triaging.\n' ;;
-  esac
-  printf '%s\n' "$AFK_HEALTH_OUT"
-fi
+[ -z "$AFK_HEALTH_OUT" ] || printf '%s\n' "$AFK_HEALTH_OUT"
 
 # Public commitments made through the myfirstmate relay. A promise to reply in a
 # public thread must survive compaction and restart, so it is surfaced from disk
