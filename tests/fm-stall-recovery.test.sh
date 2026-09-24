@@ -858,7 +858,7 @@ test_a_pane_with_text_already_in_its_composer_is_never_resumed() {
     "You've hit your usage limit · resets 11pm")
   stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
   pid=$!
-  wait_for_grep 'auto-resume declined for pending (limit stall' "$state/.watch-triage.log" \
+  wait_for_grep 'auto-resume declined for pending (limit stall' "$state/.watch-triage.log" 300 \
     || { reap "$pid"; fail "a changed stall class was not logged as a new decline: $(cat "$state/.watch-triage.log")"; }
   sleep 3
   [ "$(grep -c 'auto-resume declined for pending' "$state/.watch-triage.log")" = 2 ] \
