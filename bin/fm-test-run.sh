@@ -92,9 +92,10 @@
 #                   script that hangs past this is killed (bin/fm-timeout-lib.sh,
 #                   whole process group) and recorded as exit=124 instead of
 #                   consuming the job's own timeout with no attribution.
-#                   Default 600 (seconds), well under the CI job's own 900s
-#                   cap. The bounded --jobs>1 path does not apply this bound;
-#                   its scripts are already proven-isolated and fast.
+#                   Default 1500 (seconds), well under the tests-portable-serial
+#                   CI job's own 1800s (30 min) timeout-minutes cap. The bounded
+#                   --jobs>1 path does not apply this bound; its scripts are
+#                   already proven-isolated and fast.
 #
 # Per-script machine-parseable markers (stdout):
 #   FM_TEST_BEGIN <iso8601> <script> family=<family> expected_gate_skip=<class>
@@ -175,16 +176,23 @@ cd "$ROOT" || exit 1
 # Hard per-script bound for the serial lane (run_one_serial): a hang inside
 # one script must fail fast and name that script instead of consuming the
 # whole job's timeout budget with no attribution. Overridable for a suite
-# whose legitimately slow scripts need more room. The observed remainder is
-# ~19 min total across ~25 scripts with no single script measured over ~3
-# min on a quiet runner, but a loaded machine can stretch an individual
-# script by several times its quiet duration (observed: a normally ~66s
-# script taking >300s under local CPU contention) - a false-positive kill
-# of a merely-slow script would just trade one flake for another. 600s
-# keeps real margin over that kind of contention while staying well under
-# the job's own 900s (15 min) timeout, so a genuine hang still fails fast
-# and named instead of silently eating the whole job budget.
-FM_TEST_SCRIPT_TIMEOUT_SECONDS="${FM_TEST_SCRIPT_TIMEOUT_SECONDS:-600}"
+# whose legitimately slow scripts need more room.
+#
+# The bound cannot be tighter than the slowest genuinely-passing script, or it
+# stops being a hang tripwire and starts killing normal runs. This repo's own
+# recorded portable-serial weight table below (portable_serial_weight_hints)
+# is the evidence for that floor: tests/fm-watch-triage.test.sh alone is
+# 697969ms (~698s, ~11.6 min) - real subprocess-driven watcher-cycle work, not
+# a hang - nearly 3x the next-heaviest recorded script. A loaded machine can
+# also stretch an individual script by several times its quiet duration
+# (observed pre-merge: a normally ~66s script taking >300s under local CPU
+# contention), so the bound needs real contention margin on TOP of that
+# floor, not just barely above it. 1500s clears the known ~698s floor with
+# over 2x headroom while staying a full 300s under the
+# tests-portable-serial CI job's own 1800s (30 min) timeout-minutes cap, so a
+# genuine hang still fails fast and named instead of silently eating the
+# whole job budget or racing the job's own timeout with no attribution.
+FM_TEST_SCRIPT_TIMEOUT_SECONDS="${FM_TEST_SCRIPT_TIMEOUT_SECONDS:-1500}"
 
 MODE=
 LIST_ONLY=0
@@ -2470,15 +2478,21 @@ run_one_serial() {
 }
 
 if [ "$JOBS" -eq 1 ]; then
-  # Loaded only for the serial path (what run_one_serial's per-script bound
-  # needs), so a minimal fixture repo exercising only the --jobs>1 path is
-  # never required to carry this dependency too.
-  # shellcheck source=bin/fm-timeout-lib.sh
-  . "$ROOT/bin/fm-timeout-lib.sh"
-  # The serial lane is always bounded: without an explicit
-  # --per-script-timeout-secs, FM_TEST_SCRIPT_TIMEOUT_SECONDS applies, so a hung
-  # script fails fast and named instead of eating the job's whole budget.
-  [ "$PER_SCRIPT_TIMEOUT_SECS" -gt 0 ] || PER_SCRIPT_TIMEOUT_SECS=$FM_TEST_SCRIPT_TIMEOUT_SECONDS
+  # The serial lane is bounded WHEN the shared timeout helper is available:
+  # without an explicit --per-script-timeout-secs, FM_TEST_SCRIPT_TIMEOUT_SECONDS
+  # applies, so a hung script fails fast and named instead of eating the job's
+  # whole budget. This implicit default is best-effort, unlike an explicitly
+  # requested --per-script-timeout-secs (which dies above if the helper is
+  # missing): a minimal fixture repo carrying fm-test-run.sh without its sibling
+  # scripts must still run a plain serial invocation, so a missing helper here
+  # leaves the run unbounded instead of crashing it over an optional safety net.
+  if [ "$PER_SCRIPT_TIMEOUT_SECS" -le 0 ] && [ -r "$ROOT/bin/fm-timeout-lib.sh" ]; then
+    PER_SCRIPT_TIMEOUT_SECS=$FM_TEST_SCRIPT_TIMEOUT_SECONDS
+  fi
+  if [ "$PER_SCRIPT_TIMEOUT_SECS" -gt 0 ]; then
+    # shellcheck source=bin/fm-timeout-lib.sh
+    . "$ROOT/bin/fm-timeout-lib.sh"
+  fi
   for script in "${SCRIPTS[@]}"; do
     run_one_serial "$script"
   done
