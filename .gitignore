@@ -1,6 +1,7 @@
 projects/
 state/
 data/
+scratchpad*
 .no-mistakes/
 .lavish/
 .fm-secondmate-home
@@ -16,3 +17,5 @@ config/
 # runtime, and its own .skillignore classifies them as non-runtime material, so a
 # reinstall must not reintroduce them as drift
 .agents/skills/last30days/assets/
+
+.tools/
