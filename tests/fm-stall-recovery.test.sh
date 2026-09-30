@@ -630,6 +630,21 @@ arm_claude_task() {  # <state> <id> <window> <busy-state> <busy-event> [harness]
 # The ladder is compressed to one second so a test exercises the SCHEDULE rather
 # than waiting on it; every schedule-shape assertion is made against the pure
 # library above, where the real rungs are pinned.
+#
+# FM_WATCH_HANDLING_SUCCESSOR=1 on every launch: docs/watcher-continuity.md
+# made the watcher deliberately one-shot ("one actionable reason closes one
+# watcher cycle") and moved must-work continuity above the process boundary -
+# every real continuous-supervision relaunch is started as a successor of the
+# cycle that just closed, before or immediately after that close is delivered.
+# A bare non-successor relaunch is instead read as a genuine downtime gap: it
+# resurfaces a one-time "check: rearm-resurface" wake and exits before this
+# suite's pane ever reaches classification, which is a real behavior this
+# suite does not own (tests/fm-watch-recovery-loop.test.sh,
+# tests/fm-wake-queue.test.sh, and tests/fm-watcher-lock.test.sh do). This
+# suite tests stall classification and decline/delivery bookkeeping across
+# repeated cycles, so every relaunch here models the ordinary continuous case
+# a real supervising layer produces, not a downtime episode; the flag is a
+# no-op on a case's first launch, where no prior cycle and no marker exist.
 stall_watch_bg() {  # <dir> <window> <pane-file> <cursor-y> <out> [extra env...]
   local dir=$1 window=$2 pane=$3 cy=$4 out=$5
   shift 5
@@ -639,6 +654,7 @@ stall_watch_bg() {  # <dir> <window> <pane-file> <cursor-y> <out> [extra env...]
     FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$pane" FM_FAKE_TMUX_CURSOR_Y="$cy" \
     FM_FAKE_SEND_LOG="$dir/sent.log" \
     FM_STALL_SEND_BIN="$dir/fakebin/fm-send-fake.sh" \
+    FM_WATCH_HANDLING_SUCCESSOR=1 \
     FM_STALL_BACKOFF='1 1 1 1' FM_STALL_MAX_ATTEMPTS=99 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     env "$@" "$WATCH" > "$out" 2>&1 &
@@ -842,7 +858,7 @@ test_a_pane_with_text_already_in_its_composer_is_never_resumed() {
     "You've hit your usage limit · resets 11pm")
   stall_watch_bg "$dir" "$window" "$pane" "$cy" "$out"
   pid=$!
-  wait_for_grep 'auto-resume declined for pending (limit stall' "$state/.watch-triage.log" \
+  wait_for_grep 'auto-resume declined for pending (limit stall' "$state/.watch-triage.log" 300 \
     || { reap "$pid"; fail "a changed stall class was not logged as a new decline: $(cat "$state/.watch-triage.log")"; }
   sleep 3
   [ "$(grep -c 'auto-resume declined for pending' "$state/.watch-triage.log")" = 2 ] \
